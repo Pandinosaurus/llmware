@@ -1,4 +1,4 @@
-# Copyright 2023-2024 llmware
+# Copyright 2023-2026 llmware
 
 # Licensed under the Apache License, Version 2.0 (the "License"); you
 # may not use this file except in compliance with the License.  You
@@ -30,14 +30,12 @@ import os
 
 from llmware.util import Utilities, CorpTokenizer, Sources
 from llmware.web_services import YFinance
-from llmware.graph import Graph
 from llmware.resources import PromptState
 from llmware.models import ModelCatalog, PromptCatalog, PyTorchLoader
 from llmware.parsers import Parser
 from llmware.retrieval import Query
 from llmware.library import Library
-from llmware.exceptions import LibraryObjectNotFoundException, PromptNotInCatalogException
-from llmware.configs import LLMWareConfig
+from llmware.configs import LLMWareConfig, LLMWareException
 
 logger = logging.getLogger(__name__)
 logger.setLevel(level=LLMWareConfig().get_logging_level_by_module(__name__))
@@ -466,41 +464,6 @@ class Prompt:
 
         return sources
 
-    def add_source_knowledge_graph(self, library, query):
-
-        """ Attach a new source to a prompt object consisting of summary output elements from knowledge graph.  This is
-        a WIP / experimental method - and will likely evolve.  """
-
-        # need to check for library and for graph
-        if library:
-            self.library = library
-
-        if not self.library:
-            raise LibraryObjectNotFoundException
-
-        if self.library.get_knowledge_graph_status() == "yes":
-
-            kg_output = Graph(self.library).kg_query(query,th=10)
-            text_string_out = ""
-
-            for key, values in kg_output.items():
-                if key:
-                    text_string_out += key + " "
-                    for entries in values:
-                        text_string_out += entries + " "
-
-            source_output = [{"text": text_string_out, "page_num":0, "file_source": "knowledge_graph"}]
-
-            sources = Sources(self).package_source(source_output, aggregate_source=True)
-        else:
-            raise LibraryObjectNotFoundException
-
-        # enables use of 'prompt_with_sources'
-        if not sources["text_batch"]:
-            logger.warning("No source added in .add_source_knowledge_graph.")
-
-        return sources
-
     def add_source_website(self, url, query=None):
 
         """ Attach a website source to a prompt object by identifying the url name. """
@@ -707,8 +670,9 @@ class Prompt:
         if prompt_name in self.pc.list_all_prompts():
             self.prompt_type = prompt_name
         else:
-            raise PromptNotInCatalogException(prompt_name)
-
+            raise LLMWareException(message=f"Prompt - select_prompt_from_catalog - "
+                                           f"unable to find selected prompt in "
+                                           f"catalog - {prompt_name}")
         return self
 
     def prompt_from_catalog(self, prompt, context=None, prompt_name=None, inference_dict=None):
@@ -716,7 +680,9 @@ class Prompt:
         """ Inference method - runs a prompt by loading a specific prompt style from the catalog. """
 
         if prompt_name not in self.pc.list_all_prompts():
-            raise PromptNotInCatalogException(prompt_name)
+            raise LLMWareException(message=f"Prompt - prompt_from_catalog - could "
+                                           f"not find selected prompt in catalog - "
+                                           f"{prompt_name}")
 
         # self.llm_model.add_prompt_engineering= prompt_name
         response = self.prompt_main(prompt,context=context, prompt_name=prompt_name,inference_dict=inference_dict)

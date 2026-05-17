@@ -1,4 +1,4 @@
-# Copyright 2023-2024 llmware
+# Copyright 2023-2026 llmware
 
 # Licensed under the Apache License, Version 2.0 (the "License"); you
 # may not use this file except in compliance with the License.  You
@@ -15,24 +15,19 @@
 """The models module implements the model registry, the catalog for models and prompts, and classes that
 implement the interface for each of the supported models. """
 
-import logging
-import json
-import requests
-import tempfile
-import ast
-import time
+import os, logging, json, requests, tempfile, ast, time, shutil, importlib, sys, ctypes
+
 from collections import deque
-import shutil
-import importlib
 from importlib import util
+from typing import Mapping, Any
+from pathlib import Path
 
 from llmware.util import Utilities, AgentWriter, LocalTokenizer
-from llmware.configs import LLMWareConfig
-from llmware.exceptions import (DependencyNotInstalledException, ModuleNotFoundException,
-                                ModelCardNotRegisteredException, GGUFLibNotLoadedException, LLMWareException)
+from llmware.configs import (LLMWareConfig, LLMWareException, ModelNotFoundException,
+                             GGUFLibNotLoadedException,DependencyNotInstalledException)
 
 from llmware.model_configs import (global_model_repo_catalog_list, global_model_finetuning_prompt_wrappers_lookup,
-                                   global_default_prompt_catalog, model_benchmark_data)
+                                   global_default_prompt_catalog, model_benchmark_data, global_tokenizer_bos_eos_lookup)
 
 from llmware.gguf_configs import *
 from llmware.gguf_configs import _LlamaModel, _LlamaContext, _LlamaBatch, _LlamaTokenDataArray
@@ -49,11 +44,18 @@ GLOBAL_OVG_IMPORT = False
 GLOBAL_OPENVINO_IMPORT = False
 ovg = None
 openvino = None
+ovc = None
 
 #   onnxruntime_genai - import only if needed
 #   -- onnxruntime_genai is dependency of ONNXGenerativeModel
 GLOBAL_ONNX_GENAI_RUNTIME = False
 og = None
+
+#   onnxruntime - import only if needed
+#   -- onnxruntime is dependency of ONNXEmbeddingModel
+#   -- it is called implicitly by ONNXGenerativeModel
+GLOBAL_ONNX_CORE_RUNTIME = False
+ort = None
 
 logger = logging.getLogger(__name__)
 logger.setLevel(level=LLMWareConfig().get_logging_level_by_module(__name__))
@@ -75,6 +77,13 @@ class _ModelRegistry:
     model_classes = {"ONNXGenerativeModel": {"module": "llmware.models", "open_source": True},
                      "OVGenerativeModel": {"module": "llmware.models", "open_source": True},
                      "GGUFGenerativeModel": {"module": "llmware.models", "open_source":True},
+                     "GGUFVisionGenerativeModel": {"module": "llmware.models", "open_source":True},
+                     "OVVisionGenerativeModel": {"module": "llmware.models", "open_source": True},
+                     "ONNXQNNGenerativeModel": {"module": "llmware.models", "open_source":True},
+                     "ONNXEmbeddingModel": {"module": "llmware.models", "open_source": True},
+                     "ONNXVisionGenerativeModel": {"module": "llmware.models", "open_source":True},
+                     "OVEmbeddingModel": {"module": "llmware.models", "open_source": True},
+                     "WindowsLocalFoundryModel": {"module": "llmware.models", "open_source":True},
                      "WhisperCPPModel": {"module": "llmware.models", "open_source": True},
                      "HFGenerativeModel": {"module": "llmware.models", "open_source":True},
                      "HFReRankerModel": {"module": "llmware.models", "open_source": True},
@@ -85,12 +94,8 @@ class _ModelRegistry:
                      "OllamaModel":{"module": "llmware.models", "open_source": True},
                      "OpenAIGenModel":{"module": "llmware.models", "open_source": False},
                      "ClaudeModel":{"module": "llmware.models", "open_source": False},
-                     "GoogleGenModel":{"module": "llmware.models", "open_source": False},
-                     "CohereGenModel":{"module": "llmware.models", "open_source": False},
-                     "JurassicModel":{"module": "llmware.models", "open_source": False},
+                     "GoogleGeminiModel":{"module": "llmware.models", "open_source": False},
                      "OpenAIEmbeddingModel":{"module": "llmware.models", "open_source": False},
-                     "CohereEmbeddingModel":{"module": "llmware.models", "open_source": False},
-                     "GoogleEmbeddingModel":{"module": "llmware.models", "open_source": False}
                      }
 
     model_catalog_state_attributes = ["selected_model", "loaded_model_name", "loaded_model_class", "temperature",
@@ -104,9 +109,13 @@ class _ModelRegistry:
     #   we are treating these "prompt_wrappers" as core attributes of the model
     prompt_wrappers = ["alpaca", "human_bot", "chatgpt", "<INST>", "open_chat", "hf_chat", "chat_ml", "phi_3",
                        "llama_3_chat","tiny_llama_chat","stablelm_zephyr_chat", "google_gemma_chat",
-                       "vicuna_chat"]
+                       "vicuna_chat", "phi_4", "deepseek_chat", "phi-4-mini",
+                       "granite_chat", "lfm2_chat", "olmo_chat", "oss_chat", "phi_3_vision"]
 
     registered_wrappers = global_model_finetuning_prompt_wrappers_lookup
+
+    #   new attribute - track bos/eos for common tokenizers
+    tokenizer_bos_eos_config = global_tokenizer_bos_eos_lookup
 
     #   list of specialized function calling tools
 
@@ -135,6 +144,8 @@ class _ModelRegistry:
                         "qa_gen": "slim-qa-gen-tiny-tool"
                         }
 
+    _foundry_manager = None
+
     @classmethod
     def get_model_list(cls):
         """ List current view of registered models """
@@ -162,6 +173,11 @@ class _ModelRegistry:
         """ List current registered wrapper formats """
         return cls.registered_wrappers
 
+    # new method
+    @classmethod
+    def get_tokenizer_bos_eos_lookup(cls):
+        return cls.tokenizer_bos_eos_config
+
     @classmethod
     def get_llm_fx_tools_list (cls):
         """ List of function calling model tools available """
@@ -181,6 +197,25 @@ class _ModelRegistry:
         cls.prompt_wrappers.append(wrapper_name)
 
         return wrapper_dict
+
+    @classmethod
+    def load_prompt_wrappers_from_file(cls, new_wrapper_registry):
+
+        cls.registered_wrappers = {}
+        cls.prompt_wrappers = []
+
+        for key,value in new_wrapper_registry.items():
+            if key not in cls.prompt_wrappers:
+                cls.prompt_wrappers.append(key)
+
+            cls.registered_wrappers.update({key:value})
+
+    @classmethod
+    def load_tokenizer_configs_from_file(cls, new_tokenizer_configs):
+
+        cls.tokenizer_bos_eos_config = {}
+        for key, value in new_tokenizer_configs.items():
+            cls.tokenizer_bos_eos_config.update({key:value})
 
     @classmethod
     def validate(cls, model_card_dict):
@@ -246,7 +281,7 @@ class _ModelRegistry:
             cls.registered_models.append(model_card_dict)
 
         else:
-            raise ModelCardNotRegisteredException("New-Model-Card-Missing-Keys")
+            raise LLMWareException(message="New Model Card is Missing Keys")
 
         return model_card_dict
 
@@ -256,7 +291,7 @@ class _ModelRegistry:
         """ Updates model in the registry """
 
         if not cls.validate(new_model_card_dict):
-            raise ModelCardNotRegisteredException("New-Model-Card-Missing-Keys")
+            raise LLMWareException(message="New Model Card is missing keys.")
 
         updated=False
 
@@ -311,6 +346,31 @@ class _ModelRegistry:
     def add_model_catalog_vars(cls, new_attr):
         cls.model_catalog_state_attributes.append(new_attr)
         return True
+
+    @classmethod
+    def reset_to_default_catalog(cls):
+        cls.registered_models = global_model_repo_catalog_list
+
+
+    @classmethod
+    def get_foundry_manager(cls):
+        return cls._foundry_manager
+
+    @classmethod
+    def reset_foundry_manager(cls):
+        cls._foundry_manager = None
+        return True
+
+    @classmethod
+    def set_foundry_manager(cls, mgr):
+        cls._foundry_manager = mgr
+        return mgr
+
+    @classmethod
+    def create_new_foundry_manager(cls):
+        from foundry_local import FoundryLocalManager
+        cls._foundry_manager = FoundryLocalManager()
+        return cls._foundry_manager
 
 
 def pull_model_from_hf(model_card, local_model_repo_path, api_key=None, **kwargs):
@@ -462,6 +522,7 @@ class ModelCatalog:
         #   Builds on standard model classes with standard inference
 
         self.model_classes = _ModelRegistry().get_model_classes()
+
         self.global_model_list = _ModelRegistry().get_model_list()
 
         self.base_attributes = _ModelRegistry().get_model_catalog_vars()
@@ -503,6 +564,12 @@ class ModelCatalog:
         # will add to check manifest in global repo and make available for pull down
         return 0
 
+    def reset_to_default_catalog(self):
+        """ Resets model catalog to default list in model_configs """
+
+        _ModelRegistry().reset_to_default_catalog()
+        self.global_model_list = _ModelRegistry().get_model_list()
+
     def save_model_registry(self, fp=None, fn="llmware_model_catalog.json"):
 
         """ Utility method to export global model list to json file """
@@ -531,6 +598,68 @@ class ModelCatalog:
         self.global_model_list = _ModelRegistry().get_model_list()
 
         return 0
+
+    def load_prompt_wrapper_registry(self, fp=None, fn="prompt_wrappers.json"):
+
+        """ Utility method to load updated prompt wrapper registry from json file. Will
+        remove the current global prompt wrapper registry and replace with updated registry from file. """
+
+        if not fp:
+            fp = LLMWareConfig().get_llmware_path()
+
+        prompt_list = json.load(open(os.path.join(fp,fn), "r"))
+        _ModelRegistry().load_prompt_wrappers_from_file(prompt_list)
+
+        return True
+
+    def save_prompt_wrapper_registry(self, fp=None, fn="prompt_wrappers.json"):
+
+        """ Utility method to export global prompt wrapper list to json file """
+
+        if not fp:
+            fp = LLMWareConfig().get_llmware_path()
+
+        prompt_list = _ModelRegistry().get_wrapper_list()
+
+        json_dict = json.dumps(prompt_list, indent=1)
+        with open(os.path.join(fp, fn), "w", encoding='utf-8') as outfile:
+            outfile.write(json_dict)
+
+        return True
+
+    def get_tokenizer_bos_eos_configs(self):
+
+        """" Returns the tokenizer bos eos configs for common models. """
+
+        return _ModelRegistry().get_tokenizer_bos_eos_lookup()
+
+    def save_tokenizer_bos_eos_configs(self, fp=None, fn="tokenizer_bos_eos_configs.json"):
+
+        """ Utility method to export tokenizer bos_eos configs to json file """
+
+        if not fp:
+            fp = LLMWareConfig().get_llmware_path()
+
+        tok_configs = _ModelRegistry().get_tokenizer_bos_eos_lookup()
+
+        json_dict = json.dumps(tok_configs, indent=1)
+        with open(os.path.join(fp, fn), "w", encoding='utf-8') as outfile:
+            outfile.write(json_dict)
+
+        return True
+
+    def load_tokenizer_bos_eos_configs(self, fp=None, fn="tokenizer_bos_eos_configs.json"):
+
+        """ Utility method to load updated tokenizer bos_eos configs from json file. Will
+        remove the current tokenizer bos eos configs and replace with updated configs from file. """
+
+        if not fp:
+            fp = LLMWareConfig().get_llmware_path()
+
+        tok_config_list = json.load(open(os.path.join(fp, fn), "r"))
+        _ModelRegistry().load_tokenizer_configs_from_file(tok_config_list)
+
+        return True
 
     def add_model_cards_from_file(self, fp=None, fn="custom_models_manifest.json"):
 
@@ -810,6 +939,7 @@ class ModelCatalog:
 
         # first check in the global_model_repo + confirm location
         for models in self.global_model_list:
+
             # add option to match with display_name as alternative alias for model
             if models["model_name"] == selected_model_name or models["display_name"] == selected_model_name:
                 model_card = models
@@ -899,7 +1029,6 @@ class ModelCatalog:
                 #   to "re-direct" the model loading parameters
                 if isinstance(success_dict, dict):
                     for k, v in success_dict.items():
-                        # updating and setting attrs
                         setattr(self,k,v)
 
         return True
@@ -1271,6 +1400,19 @@ class ModelCatalog:
 
         return open_source_models
 
+    def list_models_by_type(self, model_family):
+
+        model_list = []
+
+        # e.g., model_family = "WindowsLocalFoundryModel"
+
+        for model in self.global_model_list:
+
+            if model["model_family"].lower() == model_family.lower():
+                model_list.append(model)
+
+        return model_list
+
     def list_embedding_models(self):
 
         """ Lists the embedding models in the ModelCatalog. """
@@ -1322,6 +1464,16 @@ class ModelCatalog:
         all_models = sorted(all_models, key=lambda x: x["model_category"], reverse=False)
 
         return all_models
+
+    def list_intel_npu_optimized_models(self):
+
+        npu_models = []
+        for model_card in self.global_model_list:
+            npu_optimized = model_card.get("npu_optimized","")
+            if npu_optimized:
+                npu_models.append(model_card)
+
+        return npu_models
 
     def model_lookup(self,model_name):
 
@@ -1717,8 +1869,7 @@ class ModelCatalog:
                     for x in range(0, len(logits[i])):
                         if logits[i][x][0] in marker_tokens:
 
-                            # if model catalog loaded from json config file, then dict number converted to str
-
+                            # new add 1020 - if from file, then dict number converted to str
                             if logits[i][x][0] in marker_token_lookup:
                                 entry0 = marker_token_lookup[logits[i][x][0]]
 
@@ -1727,6 +1878,7 @@ class ModelCatalog:
 
                             else:
                                 entry0 = "NA"
+                            # end here
 
                             new_entry = (entry0,
                                          logits[i][x][0],
@@ -2328,7 +2480,7 @@ class PromptCatalog:
             else:
                 updated_instruction += t + " "
 
-        logger.debug(f"prompt catalog - constructed dynamic instruction - {updated_instruction}")
+        logger.debug(f"PromptCatalog - constructed dynamic instruction - {updated_instruction}")
 
         return updated_instruction.strip()
 
@@ -2342,14 +2494,14 @@ class PromptCatalog:
 
         if not prompt_card and not prompt_name:
             # error - returning query
-            logger.warning("prompt catalog - no prompt selected in PromptCatalog().build_core_prompt")
+            logger.warning("PromptCatalog - no prompt selected in PromptCatalog().build_core_prompt")
             prompt_dict = {"core_prompt": context + "\n" + query, "prompt_card": {}}
             return prompt_dict
 
         if not prompt_card:
             prompt_card = PromptCatalog().lookup_prompt(prompt_name)
 
-        logger.debug(f"prompt catalog - prompt_card - {prompt_card}")
+        logger.debug(f"PromptCatalog - prompt_card - {prompt_card}")
 
         core_prompt = ""
 
@@ -2370,6 +2522,7 @@ class PromptCatalog:
                             core_prompt += context + separator
 
         # update instruction, if user_vars accepted in instruction
+
         """
         if "instruction" in prompt_card:
             prompt_card["instruction"] = self.parse_instruction_for_user_vars(prompt_card,inference_dict=inference_dict)
@@ -2378,7 +2531,7 @@ class PromptCatalog:
 
         prompt_dict = {"core_prompt": core_prompt, "prompt_card": prompt_card}
 
-        logger.debug(f"prompt catalog - prompt created - {prompt_dict}")
+        logger.debug(f"PromptCatalog - prompt created - {prompt_dict}")
 
         return prompt_dict
 
@@ -2398,14 +2551,17 @@ class PromptCatalog:
 
         return new_prompt_card
 
-    def apply_prompt_wrapper(self, text, prompt_wrapper, separator="\n", instruction=None):
+    def apply_prompt_wrapper(self, text, prompt_wrapper,
+                             separator="\n",
+                             instruction=None,
+                             chat_history=None):
 
         """ Applies the selected prompt_wrapper to the prompt. """
 
         output_text = text
 
         if prompt_wrapper not in self.prompt_wrappers:
-            logger.info(f"apply_prompt_wrapper - selected wrapper - {prompt_wrapper} - could not be identified - "
+            logger.info(f"PromptCatalog - apply_prompt_wrapper - selected wrapper - {prompt_wrapper} - could not be identified - "
                         f"returning text prompt without any special format wrapping")
 
             return output_text
@@ -2414,25 +2570,20 @@ class PromptCatalog:
             return self.wrap_chatgpt_sample(text, instruction)
 
         else:
-            wrapped_prompt = self.wrap_custom(text, prompt_wrapper, instruction=instruction)
+            wrapped_prompt = self.wrap_custom(text, prompt_wrapper,
+                                              instruction=instruction,
+                                              chat_history=chat_history)
+
             return wrapped_prompt
 
-    def wrap_chat_ml_sample(self, text, separator, instruction):
+    def wrap_custom(self, text, wrapper_type, chat_history=None,
+                    instruction=None):
 
-        """ Deprecated - custom handler for wrap_chat_ml_sample. Replaced by general method. """
+        """ Provides option for chat history, packaged as a list of 'turns'
+        with each turn consisting of two dictionary entries -
+        'user' and 'assistant' """
 
-        if not instruction:
-            instruction = "You are a helpful assistant."
-
-        output_text = "<|im_start|>system\n" + instruction + "<|im_end|>\n" + \
-                      "<|im_start|>user" + text + "<|im_end|>\n" + \
-                      "<|im_start|>assistant"
-
-        return output_text
-
-    def wrap_custom(self, text, wrapper_type, instruction=None):
-
-        """ Builds wrapper on Prompt based on the selected wrapper_type. """
+        #TODO: apply safeguards to max output
 
         prompt_out = ""
 
@@ -2445,6 +2596,7 @@ class PromptCatalog:
                 if prompt_template["system_start"] != "":
 
                     prompt_out += prompt_template["system_start"]
+
                     if instruction:
                         prompt_out += instruction
                     else:
@@ -2452,6 +2604,25 @@ class PromptCatalog:
 
                     if "system_stop" in prompt_template:
                         prompt_out += prompt_template["system_stop"]
+
+            if chat_history:
+
+                for turn in chat_history:
+
+                    # user part of turn
+                    if "main_start" in prompt_template:
+                        prompt_out += prompt_template["main_start"]
+
+                    prompt_out += turn["user"]
+
+                    if "main_stop" in prompt_template:
+                        prompt_out += prompt_template["main_stop"]
+
+                    # assistant part of turn
+                    if "start_llm_response" in prompt_template:
+                        prompt_out += prompt_template["start_llm_response"]
+
+                    prompt_out += turn["assistant"]
 
             if "main_start" in prompt_template:
 
@@ -2480,48 +2651,6 @@ class PromptCatalog:
                       {"role": "user", "content": text}]
 
         return new_sample
-
-    def wrap_human_bot_sample(self, text, user_separator="<human>: ", response_separator="<bot>:"):
-
-        """ Applies 'human-bot' wrapper to a prompt.  Deprecated and replaced by general method.  """
-
-        content = user_separator + text + "\n" + response_separator
-
-        return content
-
-    def wrap_llama2_chat_sample(self, text, separator):
-
-        """ Applies 'llama2 - INST' wrapper to a prompt.  Deprecated and replaced by general method.  """
-
-        content = "<INST> " + text + "</INST>"
-
-        return content
-
-    def wrap_alpaca_sample(self, text, separator="\n"):
-
-        """ Applies 'Alpaca style' wrapper to a prompt.  Deprecated and replaced by general method.  """
-
-        content = "### Instruction: " + text + separator + "### Response: "
-
-        return content
-
-    def wrap_openchat_sample(self, text, separator="\n"):
-
-        """ Applies 'openchat style' wrapper to a prompt.  Deprecated and replaced by general method.  """
-
-        content = "GPT4 User: " + text + "<|endofturn|>" + "GPT4 Assistant:"
-
-        return content
-
-    def wrap_hf_chat_zephyr_sample(self, text, separator="\n"):
-
-        """ Applies 'HF Chat - Zephyr style' wrapper to a prompt.  Deprecated and replaced by general method.  """
-
-        content = "<|system|>You are a helpful assistant.\n</s>" + \
-                  "<|user|>" + text + "\n</s>" + \
-                  "<|assistant|>"
-
-        return content
 
 
 class InferenceHistory:
@@ -2668,11 +2797,24 @@ class BaseModel:
         self.time_stamp = None
         self.model_class = None
         self.model_category = None
+        self.model_card = {}
+
+        self.tokenizer = None
+
+        self.URL_BASE = None
+        self.api_endpoint = None
+        self.unlock_on_completion = None
+
+        # parameters moved to base model
+        self.separator = "\n"
+        self.instruction_following = False
+        self.prompt_wrapper = None
+        self.add_prompt_engineering = True
 
         # output inference parameters
         for keys in self.base_model_keys:
             if keys in kwargs:
-                setattr(self,keys,kwargs[keys])
+                setattr(self, keys, kwargs[keys])
             else:
                 setattr(self, keys, None)
 
@@ -2682,10 +2824,14 @@ class BaseModel:
 
         state_dict = {}
         for keys in self.base_model_keys:
-            if hasattr(self,keys):
-                state_dict.update({keys: getattr(self,keys)})
+            if hasattr(self, keys):
+                state_dict.update({keys: getattr(self, keys)})
 
         return state_dict
+
+    def load_model_for_inference(self, loading_instructions):
+        # not implemented in base model
+        pass
 
     def method_resolver(self, config_name):
 
@@ -2726,14 +2872,39 @@ class BaseModel:
             if isinstance(success, dict):
                 #   write attributes, if any, to the Model instance state
                 for k, v in success.items():
-                    setattr(self,k,v)
+                    setattr(self, k, v)
 
         return True
+
+    def set_api_key(self, api_key, env_var="USER_MANAGED_API_KEY"):
+
+        """ Sets the API key - generally not needed for self-hosted models. """
+
+        os.environ[env_var] = api_key
+        logger.info("BaseModel - added and stored api_key in environmental "
+                    "variable- %s", env_var)
+
+        return self
+
+    def _get_api_key(self, env_var="USER_MANAGED_API_KEY"):
+
+        """ Gets API key from os.environ variable. """
+        self.api_key = os.environ.get(env_var)
+
+        if not self.api_key:
+            logger.error("BaseModel - _get_api_key could not successfully "
+                         "retrieve value from: %s ", env_var)
+
+        return self.api_key
 
     def post_init(self):
         return self.method_resolver("model_post_init")
 
     def register(self):
+
+        if self.unlock_on_completion:
+            ModelResources().unlock(self.unlock_on_completion)
+
         return self.method_resolver("model_register")
 
     def validate(self):
@@ -2741,6 +2912,159 @@ class BaseModel:
 
     def preview(self):
         return self.method_resolver("model_preview")
+
+    def _lookup_endpoint(self, api_name, api_catalog):
+
+        """ Internal lookup utility to pull api card. """
+
+        for entries in api_catalog:
+            if entries["api_name"] == api_name:
+                return entries
+
+        return {}
+
+    def prune_context(self, ctx, front=100,back=100):
+
+        # apply pruning of stop words
+        pruned_ctx = Utilities().prune_stop_words(ctx,front=front,back=back)
+
+        # test len
+        pruned_tokens = self.count_tokens(pruned_ctx)
+
+        logger.info(f"BaseModel - prune_context - token count - {pruned_tokens}")
+
+        # extra pruning for very large contexts
+        # need to reduce for 14B parameter models
+        if pruned_tokens > 16000:
+            start = pruned_ctx[0:1000]
+            end = pruned_ctx[pruned_tokens-5000:]
+            super_pruned = start + end
+            pruned_tokens = self.count_tokens(super_pruned)
+            logger.info(f"BaseModel - prune_context - token count - {pruned_tokens}")
+            pruned_ctx = super_pruned
+
+        return pruned_ctx
+
+    def count_tokens(self, ctx, tokenizer=None):
+
+        if not tokenizer:
+            tokenizer = self.tokenizer
+
+        toks = tokenizer.encode(ctx)
+        tok_len = len(toks.ids)
+        return tok_len
+
+    def prompt_engineer(self, query, context, inference_dict):
+
+        """ Applies prompt and templating preparation. """
+
+        # adding chat history to inference_dict handler
+
+        chat_history = None
+        system_instruction = None
+
+        if inference_dict:
+            if "system_instruction" in inference_dict:
+                system_instruction = inference_dict["system_instruction"]
+
+            if "chat_history" in inference_dict:
+                chat_history = inference_dict["chat_history"]
+
+        if self.instruction_following:
+            logger.info(f"BaseModel - prompt_engineer - found deprecated setting - "
+                        f"instruction_following set to True - may cause unpredictable results.")
+
+        # self.instruction_following = False
+
+        # if loaded model was not pretrained on instruction_following, then skip any instructions
+        if not self.instruction_following:
+
+            if context:
+                output = context + "\n" + query
+            else:
+                output = query
+
+            # unlikely that there would be an 'instruct wrapping' on text, but allow for possibility
+            if self.prompt_wrapper:
+                output = PromptCatalog().apply_prompt_wrapper(output,
+                                                              self.prompt_wrapper,
+                                                              chat_history=chat_history,
+                                                              instruction=system_instruction)
+
+            return output
+
+        # move ahead to add instructions and prompt engineering
+
+        if not self.add_prompt_engineering:
+            if context:
+                selected_prompt = "default_with_context"
+            else:
+                selected_prompt = "default_no_context"
+        else:
+            selected_prompt = self.add_prompt_engineering
+
+        prompt_dict = PromptCatalog().build_core_prompt(prompt_name=selected_prompt,
+                                                        separator=self.separator,
+                                                        query=query,
+                                                        context=context,
+                                                        inference_dict=inference_dict)
+
+        if prompt_dict:
+            prompt_engineered = prompt_dict["core_prompt"]
+        else:
+            # default case
+            prompt_engineered = "Please read the following text: " + context + self.separator
+            prompt_engineered += "Based on this text, please answer the question: " + query + self.separator
+            prompt_engineered += "Please answer the question only with facts provided in the materials.  " \
+                                 "If the question can not be answered in the materials, then please " \
+                                 "respond 'Not Found.'"
+
+        #   final wrapping, based on model-specific instruct training format
+        #   --provides a final 'wrapper' around the core prompt text, based on model expectations
+
+        if self.prompt_wrapper:
+            prompt_engineered = PromptCatalog().apply_prompt_wrapper(prompt_engineered, self.prompt_wrapper,
+                                                                     instruction=None)
+
+        return prompt_engineered
+
+    def function_call(self, context, function=None, params=None, get_logits=False,
+                      temperature=-99, max_output=None):
+
+        """ This is the key inference method for SLIM models - takes a context passage and a key list
+        which is packaged in the prompt as the keys for the dictionary output"""
+
+        output_response = {}
+
+        return output_response
+
+    def fc_prompt_engineer(self, context, params=None, function=None,
+                           trailing_space= ""):
+
+        """ Prompt engineering for Function Call prompts. """
+
+        # prepare SLIM prompt
+        class_str = ""
+        for key in params:
+            class_str += str(key) + ", "
+        if class_str.endswith(", "):
+            class_str = class_str[:-2]
+
+        f = str(function)
+
+        # key templating format for SLIM function calls
+        full_prompt = "<human>: " + context + "\n" + "<{}> {} </{}>".format(f, class_str, f) + "\n<bot>:"
+
+        full_prompt = full_prompt + trailing_space
+
+        return full_prompt
+
+    def close(self):
+
+        """ General purpose 'close' method with any special wind-down
+        procedures at the time of closing out an inferencing session. """
+
+        pass
 
 
 class ONNXGenerativeModel(BaseModel):
@@ -2960,11 +3284,6 @@ class ONNXGenerativeModel(BaseModel):
                                            f"\n3. model could not be found at this path, or is not a valid ONNX model."
                                    )
 
-        # set to defaults for HF models in Model Catalog
-        # this can be over-ridden post initiation if needed for custom models
-        self.prompt_wrapper = "human_bot"
-        self.instruction_following = False
-
         search_options = {}
 
         # max length set at minimum of 2048
@@ -3087,6 +3406,10 @@ class ONNXGenerativeModel(BaseModel):
 
         """ Executes generation inference on model. """
 
+        from llmware.configs import ONNXConfig
+
+        legacy = ONNXConfig().get_legacy_flag()
+
         global og
 
         # first prepare the prompt
@@ -3149,7 +3472,10 @@ class ONNXGenerativeModel(BaseModel):
             text_prompt = prompt_final + self.trailing_space
 
         input_tokens = self.tokenizer.encode(text_prompt)
-        self.params.input_ids = input_tokens
+
+        if legacy:
+            self.params.input_ids = input_tokens
+
         token_count = 0
         output = ""
 
@@ -3166,10 +3492,16 @@ class ONNXGenerativeModel(BaseModel):
         t_gen_start = time.time()
         first_token_processing_time = -1.0
 
+        if not legacy:
+            generator.append_tokens(input_tokens)
+
         while not generator.is_done():
 
             token_count += 1
-            generator.compute_logits()
+
+            if legacy:
+                generator.compute_logits()
+
             generator.generate_next_token()
 
             # get logits - in most cases, get_logits is set to False for basic inference
@@ -3294,6 +3626,9 @@ class ONNXGenerativeModel(BaseModel):
         """ This is the key inference method for SLIM models - takes a context passage and a key list
         which is packaged in the prompt as the keys for the dictionary output"""
 
+        from llmware.configs import ONNXConfig
+        legacy = ONNXConfig().get_legacy_flag()
+
         t0 = time.time()
 
         self.context = context
@@ -3342,7 +3677,10 @@ class ONNXGenerativeModel(BaseModel):
         prompt = self.fc_prompt_engineer(self.context, params=self.primary_keys, function=self.function)
 
         input_tokens = self.tokenizer.encode(prompt)
-        self.params.input_ids = input_tokens
+
+        if legacy:
+            self.params.input_ids = input_tokens
+
         token_count = 0
         output = ""
 
@@ -3354,10 +3692,15 @@ class ONNXGenerativeModel(BaseModel):
                                            f"installation of the onnxruntime, or a problem with loading either the "
                                            f"model or the input tokens.")
 
+        if not legacy:
+            generator.append_tokens(input_tokens)
+
         while not generator.is_done():
 
             token_count += 1
-            generator.compute_logits()
+
+            if legacy:
+                generator.compute_logits()
 
             # to get logit value
             if self.get_logits:
@@ -3451,6 +3794,9 @@ class ONNXGenerativeModel(BaseModel):
 
         """ Executes stream generation inference on model. """
 
+        from llmware.configs import ONNXConfig
+        legacy = ONNXConfig().get_legacy_flag()
+
         # first prepare the prompt
         t0 = time.time()
 
@@ -3512,7 +3858,10 @@ class ONNXGenerativeModel(BaseModel):
             text_prompt = prompt_final + self.trailing_space
 
         input_tokens = self.tokenizer.encode(text_prompt)
-        self.params.input_ids = input_tokens
+
+        if legacy:
+            self.params.input_ids = input_tokens
+
         token_count = 0
         output = ""
 
@@ -3525,10 +3874,16 @@ class ONNXGenerativeModel(BaseModel):
                                            f"installation of the onnxruntime, or a problem with loading either the "
                                            f"model or the input tokens.")
 
+        if not legacy:
+            self.generator.append_tokens(input_tokens)
+
         while not self.generator.is_done():
 
             token_count += 1
-            self.generator.compute_logits()
+
+            if legacy:
+                self.generator.compute_logits()
+
             self.generator.generate_next_token()
 
             self.get_logits = False
@@ -3733,7 +4088,8 @@ class OVGenerativeModel(BaseModel):
     def __init__(self, model=None, tokenizer=None, model_name=None, api_key=None, model_card=None,
                  prompt_wrapper=None, instruction_following=False, context_window=2048,
                  sample=False,max_output=100, temperature=0.0,
-                 get_logits=False, api_endpoint=None, device="GPU", **kwargs):
+                 get_logits=False, api_endpoint=None, device="GPU",
+                 pipeline="text2text", **kwargs):
 
         super().__init__()
 
@@ -3750,6 +4106,8 @@ class OVGenerativeModel(BaseModel):
         self.tokenizer = tokenizer
         self.sample=sample
         self.get_logits=get_logits
+
+        self.pipeline = pipeline
 
         if get_logits:
             logger.warning(f"OVGenerativeModel - current implementation does not support "
@@ -3769,6 +4127,11 @@ class OVGenerativeModel(BaseModel):
 
         self.cache_dir = None
 
+        self.device = device
+
+        if "device" in kwargs:
+            self.device = kwargs["device"]
+
         if model_card:
 
             if "primary_keys" in model_card:
@@ -3785,6 +4148,13 @@ class OVGenerativeModel(BaseModel):
 
             if "cache_dir" in model_card:
                 self.cache_dir = model_card["cache_dir"]
+
+            if "pipeline" in model_card:
+                self.pipeline = model_card["pipeline"]
+
+            # will auto-detect NPU model and set device accordingly
+            if "npu_optimized" in model_card:
+                self.device = "NPU"
 
         # insert dynamic openvino load here
         if not api_endpoint:
@@ -3871,11 +4241,6 @@ class OVGenerativeModel(BaseModel):
         #   use_gpu parameter not used - deprecated
         self.use_gpu = False
 
-        self.device = device
-
-        if "device" in kwargs:
-            self.device = kwargs["device"]
-
         if "cache_dir" in kwargs:
             self.cache_dir = kwargs["cache_dir"]
 
@@ -3918,6 +4283,8 @@ class OVGenerativeModel(BaseModel):
         #   exposes more options for configuration of the underlying OpenVino implementation
 
         #   if config set to CPU - then ensure CPU execution
+        #   note: if set, this will over-ride any other settings
+
         if OVConfig().get_config("device") == "CPU":
             self.device = "CPU"
             self.optimize_for_gpu_if_available = False
@@ -3934,6 +4301,14 @@ class OVGenerativeModel(BaseModel):
 
         self.get_token_counts = OVConfig().get_config("get_token_counts")
 
+        #   check for llmware path & create if not already set up
+        if not os.path.exists(LLMWareConfig.get_llmware_path()):
+            # if not explicitly set up by user, then create folder directory structure
+            LLMWareConfig.setup_llmware_workspace()
+
+        if not os.path.exists(LLMWareConfig.get_model_repo_path()):
+            os.mkdir(LLMWareConfig.get_model_repo_path())
+
         # please note that the external tokenizer is used solely for producing
         # input and output token counts - and can be switched off in OVConfig
         if self.get_token_counts:
@@ -3943,7 +4318,8 @@ class OVGenerativeModel(BaseModel):
 
         self.post_init()
 
-    def load_model_for_inference(self, loading_directions, model_card=None, **kwargs):
+    def load_model_for_inference (self, loading_directions,
+                                  model_card=None, pipeline=None,**kwargs):
 
         """ Loads OV Model from local path using loading directions. """
 
@@ -3952,10 +4328,16 @@ class OVGenerativeModel(BaseModel):
         self.model_repo_path = loading_directions
         if model_card:
             self.model_card = model_card
+            if "pipeline" in self.model_card:
+                self.pipeline = self.model_card["pipeline"]
+
+        if pipeline:
+            self.pipeline = pipeline
 
         self.validate()
 
-        if self.device == "GPU" or self.optimize_for_gpu_if_available:
+        if self.device == "GPU" or (self.device == "CPU" and self.optimize_for_gpu_if_available):
+
             device = self.device_resolver()
             if device != self.device:
                 # resets self.device to the resolved device
@@ -3980,45 +4362,16 @@ class OVGenerativeModel(BaseModel):
 
         #   default is to cache to optimize performance on subsequent loads
 
-        if self.cache:
-            if self.cache_with_model:
-                # will put the cache files co-located with the model assets
-                path_to_cache_dir = loading_directions
-            else:
-                path_to_cache_dir = self.cache_custom
-
-            if self.verbose_mode:
-                logger.info(f"OVGenerativeModel - creating pipeline - "
-                            f"{self.device} - {self.cache} - {path_to_cache_dir}")
-
-            try:
-                #TODO: need to test safety of path_to_cache_dir input in LLMPipeline constructor
-
-                self.pipe = ovg.LLMPipeline(loading_directions, self.device,
-                                            {"CACHE_DIR": path_to_cache_dir})
-
-            except:
-                raise LLMWareException(message=f"OVGenerativeModel - attempt to instantiate LLMPipeline failed - "
-                                               f"this could be for a number of reasons, including: "
-                                               f"\n1. openvino and openvino_genai installs are not supported "
-                                               f"on this os / hardware platform."
-                                               f"\n2. the model could not found at path: {loading_directions}, or "
-                                               f"\n3. the model may not a valid OpenVino format model.")
+        #   build pipeline based on type
+        if self.pipeline == "text2image":
+            self.ov_text_to_image_pipeline()
         else:
-
-            #TODO: confirm that empty plugin instructions with no caching will work on all platforms
-            try:
-                self.pipe = ovg.LLMPipeline(loading_directions, self.device, {})
-            except:
-                raise LLMWareException(message=f"OVGenerativeModel - attempt to instantiate LLMPipeline failed - "
-                                               f"this could be for a number of reasons, including: "
-                                               f"\n1. openvino and openvino_genai installs are not supported "
-                                               f"on this os / hardware platform."
-                                               f"\n2. the model could not found at path: {loading_directions}, or "
-                                               f"\n3. the model may not a valid OpenVino format model.")
+            # default: text2text
+            self.ov_text_to_text_pipeline()
 
         if self.verbose_mode:
-            logger.info("OVGenerativeModel - completed new pipe creation")
+            logger.info(f"OVGenerativeModel - completed new pipe creation - "
+                        f"{self.pipeline}")
 
         return self
 
@@ -4035,13 +4388,13 @@ class OVGenerativeModel(BaseModel):
 
             core = openvino.Core()
             gpu_device_name = core.get_property("GPU", "FULL_DEVICE_NAME")
-            logger.warning(f"OVGenerativeModel - loading - confirmed GPU device name: "
+            logger.info(f"OVGenerativeModel - loading - confirmed GPU device name: "
                            f"{gpu_device_name}")
             device = "GPU"
 
         except:
 
-            logger.warning("OVGenerativeModel - loading - could not find GPU - setting device for CPU")
+            logger.info("OVGenerativeModel - loading - could not find GPU - setting device for CPU")
             device = "CPU"
 
         return device
@@ -4077,6 +4430,99 @@ class OVGenerativeModel(BaseModel):
         else:
             # if no tokenizer found, then falls back to default tokenizer for 'approximate' count
             self.tokenizer = Utilities().get_default_tokenizer()
+
+    def ov_text_to_text_pipeline(self):
+
+        """ Main entry point for instantiating models """
+
+        loading_directions = self.model_repo_path
+
+        global ovg
+
+        if self.cache:
+            if self.cache_with_model:
+                # will put the cache files co-located with the model assets
+                path_to_cache_dir = loading_directions
+            else:
+                path_to_cache_dir = self.cache_custom
+
+            if self.verbose_mode:
+                logger.info(f"OVGenerativeModel - creating pipeline - "
+                            f"{self.device} - {self.cache} - {path_to_cache_dir}")
+
+            try:
+
+                self.pipe = ovg.LLMPipeline(loading_directions, self.device,
+                                            {"CACHE_DIR": path_to_cache_dir})
+
+            except:
+                raise LLMWareException(message=f"OVGenerativeModel - attempt to instantiate LLMPipeline failed - "
+                                               f"this could be for a number of reasons, including: "
+                                               f"\n1. openvino and openvino_genai installs are not supported "
+                                               f"on this os / hardware platform."
+                                               f"\n2. the model could not found at path: {loading_directions}, or "
+                                               f"\n3. the model may not a valid OpenVino format model.")
+        else:
+
+            #TODO: confirm that empty plugin instructions with no caching will work on all platforms
+            try:
+                self.pipe = ovg.LLMPipeline(loading_directions, self.device, {})
+            except:
+                raise LLMWareException(message=f"OVGenerativeModel - attempt to instantiate LLMPipeline failed - "
+                                               f"this could be for a number of reasons, including: "
+                                               f"\n1. openvino and openvino_genai installs are not supported "
+                                               f"on this os / hardware platform."
+                                               f"\n2. the model could not found at path: {loading_directions}, or "
+                                               f"\n3. the model may not a valid OpenVino format model.")
+
+        return True
+
+    def ov_text_to_image_pipeline(self):
+
+        """ Model loading entry point for new OpenVINO text_to_image
+        pipeline for multimedia models that generate images from text prompt. """
+
+        global ovg
+
+        # auto set to GPU for faster generation
+
+        text_encoder_device = "GPU"
+        unet_device = "GPU"
+        vae_decoder_device = "GPU"
+
+        width = 512
+        height = 512
+
+        self.pipe = ovg.Text2ImagePipeline(self.model_repo_path)
+
+        self.pipe.reshape(1, height, width, self.pipe.get_generation_config().guidance_scale)
+        properties = {"CACHE_DIR": self.model_repo_path}
+
+        self.pipe.compile(text_encoder_device, unet_device, vae_decoder_device, config=properties)
+
+        return True
+
+    def text_to_image_gen(self, prompt, image_name):
+
+        """ Specialized generation function for image generating models. """
+
+        from PIL import Image
+
+        # experiment with different step numbers
+        # will expose as parameter in future releases
+
+        number_of_inference_steps_per_image = 10
+
+        tmp_path = LLMWareConfig().get_tmp_path()
+        img_path = os.path.join(tmp_path, str(image_name) + ".bmp")
+
+        image_tensor = self.pipe.generate(prompt,
+                                          num_inference_steps=number_of_inference_steps_per_image)
+
+        image = Image.fromarray(image_tensor.data[0])
+        image.save(img_path)
+
+        return img_path
 
     def ov_token_counter(self, text):
 
@@ -4153,7 +4599,7 @@ class OVGenerativeModel(BaseModel):
 
         return prompt_engineered
 
-    def _generate_ov_genai(self, prompt):
+    def _generate_ov_genai(self, prompt, streamer=None):
 
         """ Core generation script provided by generation loop exposed in the OpenVino_GenAI library. """
 
@@ -4176,9 +4622,22 @@ class OVGenerativeModel(BaseModel):
         config.do_sample = self.sample
 
         #   core generation step - runs generation loop on pipe with prompt and config
-        output = self.pipe.generate(prompt, config)
+        if streamer:
+            output = self.pipe.generate(prompt, config, streamer=streamer)
+        else:
+            output = self.pipe.generate(prompt, config)
 
         return output
+
+    @staticmethod
+    def ov_default_streamer(x):
+
+        """ Stream to console - used by default in stream method -
+        can be over-ridden by passing a custom streaming function to
+        the stream generate call. """
+
+        print(x, end="", flush=True)
+        return ovg.StreamingStatus.RUNNING
 
     def inference(self, prompt, add_context=None, add_prompt_engineering=None, api_key=None,
                   inference_dict=None):
@@ -4548,14 +5007,140 @@ class OVGenerativeModel(BaseModel):
         return output
 
     def stream(self, prompt, add_context=None, add_prompt_engineering=None, api_key=None,
-               inference_dict=None):
+                  inference_dict=None, streamer=None):
 
-        """ Not currently implemented. """
+        """ Executes stream generation inference on model.
 
-        logger.warning(f"OVGenerativeModel - streaming option not provided by current implementation. "
-                       f"Use .inference or .function_call methods for generation.")
+        NOTE: operates differently than other stream methods in LLMWare -
+        the method is not a generator, but rather the streaming update is
+        provided through passing a streamer function to the OpenVINO
+        backend - which will be called at each step of the generation
+        cycle.
 
-        return ""
+        Sample call:
+
+            # will automatically use default streamer to print to console
+            response = model.stream('Where is Paris?')
+
+            # pass a custom streaming function
+            response = model.stream('Where is Rome?', streamer=my_streamer)
+
+        Streamer function example: .ov_default_streamer in this model class
+
+        """
+
+        # first prepare the prompt
+        self.prompt = prompt
+
+        if add_context:
+            self.add_context = add_context
+
+        self.context = self.add_context
+
+        if add_prompt_engineering:
+            self.add_prompt_engineering = add_prompt_engineering
+
+        #   add defaults if add_prompt_engineering not set
+        if not self.add_prompt_engineering:
+
+            if self.add_context:
+                self.add_prompt_engineering = "default_with_context"
+            else:
+                self.add_prompt_engineering = "default_no_context"
+
+        #   end - defaults update
+
+        #   show warning if function calling model
+        if self.fc_supported:
+            logger.warning("OVGenerativeModel - this is a function calling model - using .inference may lead "
+                           "to unexpected results.  Recommended to use the .function_call method to ensure "
+                           "correct prompt template packaging.")
+
+        if inference_dict:
+
+            if "temperature" in inference_dict:
+                self.temperature = inference_dict["temperature"]
+
+            if "max_tokens" in inference_dict:
+                self.target_requested_output_tokens = inference_dict["max_tokens"]
+
+        self.preview()
+
+        #   START - route to api endpoint
+        if self.api_endpoint:
+            return self.inference_over_api_endpoint(self.prompt, context=self.add_context,
+                                                    inference_dict=inference_dict)
+        #   END - route to api endpoint
+
+        text_prompt = self.prompt
+
+        if self.add_prompt_engineering:
+            prompt_enriched = self.prompt_engineer(self.prompt, self.add_context, inference_dict=inference_dict)
+            prompt_final = prompt_enriched
+            text_prompt = prompt_final + self.trailing_space
+
+        #   counts the input tokens
+        if self.get_token_counts:
+            self.input_token_count = self.ov_token_counter(text_prompt)
+        else:
+            self.input_token_count = 0
+
+        time_start = time.time()
+
+        #   main call to inner generate function
+        if not streamer:
+            streamer = self.ov_default_streamer
+
+        output = self._generate_ov_genai(text_prompt, streamer=streamer)
+
+        output_str = output
+
+        # post-processing clean-up - stop at endoftext
+        eot = output_str.find("<|endoftext|>")
+        if eot > -1:
+            output_str = output_str[:eot]
+
+        # new post-processing clean-up - stop at </s>
+        eots = output_str.find("</s>")
+        if eots > -1:
+            output_str = output_str[:eots]
+
+        # post-processing clean-up - start after bot wrapper
+        bot = output_str.find("<bot>:")
+        if bot > -1:
+            output_str = output_str[bot + len("<bot>:"):]
+
+        # new post-processing cleanup - skip repeating starting <s>
+        boss = output_str.find("<s>")
+        if boss > -1:
+            output_str = output_str[boss + len("<s>"):]
+
+        # end - post-processing
+
+        # counts the output tokens
+        if self.get_token_counts:
+            self.output_token_count = self.ov_token_counter(output_str)
+        else:
+            self.output_token_count = 0
+
+        usage = {"input": self.input_token_count,
+                 "output": self.output_token_count,
+                 "total": self.input_token_count + self.output_token_count,
+                 "metric": "tokens",
+                 "processing_time": time.time() - time_start}
+
+        output_response = {"llm_response": output_str, "usage": usage}
+
+        self.get_logits = False
+
+        # output inference parameters
+        self.llm_response = output_str
+        self.usage = usage
+        self.final_prompt = text_prompt
+
+        self.register()
+
+        return output_response
 
     def function_call_over_api_endpoint(self, context="", tool_type="", model_name="", params="", prompt="",
                                         function=None, endpoint_base=None, api_key=None, get_logits=False):
@@ -4632,6 +5217,500 @@ class OVGenerativeModel(BaseModel):
         self.register()
 
         return output
+
+
+class OVVisionGenerativeModel(BaseModel):
+
+    """ OVVisionGenerativeModel class implements the OpenVino generative model interface for fast inference
+    performance on x86 Intel architectures, including both Intel CPU and GPU.  """
+
+    def __init__(self, model=None, tokenizer=None, model_name=None, api_key=None, model_card=None,
+                 prompt_wrapper=None, instruction_following=False, context_window=2048,
+                 sample=False,max_output=100, temperature=0.0,
+                 get_logits=False, api_endpoint=None, device="GPU",
+                 pipeline="image2text", **kwargs):
+
+        super().__init__()
+
+        self.model_class = "OVVisionGenerativeModel"
+        self.model_category = "generative"
+        self.llm_response = None
+        self.usage = None
+        self.logits = None
+        self.output_tokens = None
+        self.final_prompt = None
+        self.model_name = model_name
+        self.hf_tokenizer_name = model_name
+        self.model = model
+        self.tokenizer = tokenizer
+        self.sample=sample
+        self.get_logits=get_logits
+
+        self.pipeline = pipeline
+
+        if get_logits:
+            logger.warning(f"OVGenerativeModel - current implementation does not support "
+                           f"get_logits option.")
+            self.get_logits = False
+
+        self.auto_remediate_function_call_output = True
+
+        # Function Call parameters
+        self.model_card = model_card
+        self.logits_record = []
+        self.output_tokens = []
+        self.top_logit_count = 10
+        self.primary_keys = None
+        self.function = None
+        self.fc_supported = False
+
+        self.cache_dir = None
+
+        if model_card:
+
+            if "primary_keys" in model_card:
+                self.primary_keys = model_card["primary_keys"]
+
+            if "function" in model_card:
+                self.function = model_card["function"]
+
+            if "function_call" in model_card:
+                self.fc_supported = model_card["function_call"]
+
+            #   will look for special cache_dir set in the model card
+            #   can be over-ridden if passed as kwarg in loading model
+
+            if "cache_dir" in model_card:
+                self.cache_dir = model_card["cache_dir"]
+
+            if "pipeline" in model_card:
+                self.pipeline = model_card["pipeline"]
+
+        # insert dynamic openvino load here
+        if not api_endpoint:
+
+            global openvino
+            global ovg
+            global GLOBAL_OVG_IMPORT
+            global GLOBAL_OPENVINO_IMPORT
+
+            if not GLOBAL_OPENVINO_IMPORT or not GLOBAL_OVG_IMPORT:
+
+                if not util.find_spec("openvino") or not util.find_spec("openvino_genai"):
+                    raise LLMWareException(message="OVGenerativeModel: to use OVGenerativeModel requires "
+                                                   "install of 'openvino' and 'openvino_genai' libraries.  "
+                                                   "Please try: `pip3 install openvino` and "
+                                                   "`pip3 install openvino_genai` and confirm that your "
+                                                   "hardware platform is supported.")
+
+                if util.find_spec("openvino"):
+                    try:
+                        openvino = importlib.import_module("openvino")
+                        GLOBAL_OPENVINO_IMPORT = True
+                    except:
+                        raise LLMWareException(message="OVGenerativeModel: could not load openvino module.")
+
+                if openvino:
+                    if util.find_spec("openvino_genai"):
+                        try:
+                            ovg = importlib.import_module("openvino_genai")
+                            GLOBAL_OVG_IMPORT = True
+                        except:
+                            raise LLMWareException(message="OVGenerativeModel: could not load openvino_genai module.")
+
+                if not openvino or not ovg:
+                    raise LLMWareException(message="OVGenerativeModel: could not load required openvino dependencies.")
+
+        # end dynamic import here
+
+        # set specific parameters associated with custom models
+        # note - these two parameters will control how prompts are handled - model-specific
+        self.prompt_wrapper = prompt_wrapper
+        self.instruction_following = instruction_following
+
+        if not model_card:
+            # safety - empty iterable rather than 'None'
+            model_card = {}
+
+        if "instruction_following" in model_card:
+            self.instruction_following = model_card["instruction_following"]
+        else:
+            self.instruction_following = False
+
+        if "prompt_wrapper" in model_card:
+            self.prompt_wrapper = model_card["prompt_wrapper"]
+        else:
+            self.prompt_wrapper = "human_bot"
+
+        #   sets trailing space default when constructing the prompt
+        #   in most cases, this is * no trailing space * but for some models, a trailing space or "\n" improves
+        #   performance
+
+        self.trailing_space = ""
+
+        if "trailing_space" in model_card:
+            self.trailing_space = model_card["trailing_space"]
+
+        self.model_type = None
+        self.config = None
+
+        # parameters on context len + output generation
+        self.max_total_len = context_window
+        self.max_input_len = int(0.5 * context_window)
+        self.llm_max_output_len = int(0.5 * context_window)
+
+        # key output parameters
+        self.max_output=max_output
+        self.target_requested_output_tokens = self.max_output
+
+        self.model_architecture = None
+        self.separator = "\n"
+
+        # eos_token_id set as list to allow for more than one id
+        self.eos_token_id = []
+
+        #   use_gpu parameter not used - deprecated
+        self.use_gpu = False
+
+        self.device = device
+
+        if "device" in kwargs:
+            self.device = kwargs["device"]
+
+        if "cache_dir" in kwargs:
+            self.cache_dir = kwargs["cache_dir"]
+
+        # no api key expected or required
+        self.api_key = api_key
+
+        self.error_message = "\nUnable to identify and load model."
+
+        # temperature settings
+
+        # if temperature set at time of loading the model, then use that setting
+        if temperature != -99:
+            self.temperature = temperature
+        elif "temperature" in model_card:
+            # if not set, then pull the default temperature from the model card
+            self.temperature = model_card["temperature"]
+        else:
+            # if no guidance from model loading or model card, then set at default of 0.3
+            self.temperature = 0.3
+
+        self.add_prompt_engineering = False
+        self.add_context = ""
+        self.context = ""
+        self.prompt = ""
+        self.tool_type = ""
+
+        self.api_endpoint = api_endpoint
+        self.pipe = None
+
+        self.input_token_count = 0
+        self.output_token_count = 0
+        self.params = None
+        self.model_repo_path = None
+
+        self.tokenizer_fn = ""
+
+        from llmware.configs import OVConfig
+
+        #   OVConfig object provided in llmware.configs - in most cases, will not be touched, but
+        #   exposes more options for configuration of the underlying OpenVino implementation
+
+        #   if config set to CPU - then ensure CPU execution
+        if OVConfig().get_config("device") == "CPU":
+            self.device = "CPU"
+            self.optimize_for_gpu_if_available = False
+        else:
+            self.optimize_for_gpu_if_available = OVConfig().optimize_for_gpu()
+
+        self.generation_version = OVConfig().generation_version()
+        self.cache = OVConfig().get_config("cache")
+        self.cache_with_model = OVConfig().get_config("cache_with_model")
+        self.cache_custom = OVConfig().get_config("cache_custom_path")
+        self.apply_performance_hints = OVConfig().get_config("apply_performance_hints")
+        self.use_ov_tokenizer = OVConfig().get_config("use_ov_tokenizer")
+        self.verbose_mode = OVConfig().get_config("verbose_mode")
+
+        self.get_token_counts = OVConfig().get_config("get_token_counts")
+
+        #   check for llmware path & create if not already set up
+        if not os.path.exists(LLMWareConfig.get_llmware_path()):
+            # if not explicitly set up by user, then create folder directory structure
+            LLMWareConfig.setup_llmware_workspace()
+
+        if not os.path.exists(LLMWareConfig.get_model_repo_path()):
+            os.mkdir(LLMWareConfig.get_model_repo_path())
+
+        # please note that the external tokenizer is used solely for producing
+        # input and output token counts - and can be switched off in OVConfig
+        if self.get_token_counts:
+            self.load_ov_external_tokenizer()
+
+        self.performance_hints = OVConfig().get_gpu_hints()
+
+        self.post_init()
+
+    def load_model_for_inference (self, loading_directions,
+                                  model_card=None, pipeline=None,**kwargs):
+
+        """ Loads OV Model from local path using loading directions. """
+
+        global ovg
+
+        self.model_repo_path = loading_directions
+        if model_card:
+            self.model_card = model_card
+
+        self.validate()
+
+        if self.device == "GPU" or (self.device == "CPU" and self.optimize_for_gpu_if_available):
+
+            device = self.device_resolver()
+            if device != self.device:
+                # resets self.device to the resolved device
+                # if changed, then warning provided by resolver method
+                self.device = device
+
+        if self.device == "GPU" and self.apply_performance_hints:
+
+            for k,v in self.performance_hints.items():
+
+                try:
+                    # sets GPU performance hints thru openvino core
+                    core = openvino.Core()
+                    core.set_property("GPU", {k:v})
+
+                    if self.verbose_mode:
+                        logger.info(f"OVVisionGenerativeModel - setting performance hint - {k} - {v}")
+                except:
+                    logger.warning(f"OVVisionGenerativeModel - unsuccessful setting performance hint - {k} - {v}")
+
+        #   default is to cache to optimize performance on subsequent loads
+
+        properties = {"CACHE_DIR": self.model_repo_path}
+
+        self.pipe = ovg.VLMPipeline(self.model_repo_path, self.device,**properties)
+
+        if self.verbose_mode:
+            logger.info(f"OVVisionGenerativeModel - completed new pipe creation - "
+                        f"{self.model_name} - on device {self.device}")
+
+        return self
+
+    def device_resolver(self):
+
+        """ By default, will look for 'GPU' and if device found, then will select - if no GPU,
+        then falls back to 'CPU'. """
+
+        global ovg
+
+        try:
+
+            # check if GPU device can be found successfully - if not, auto fallback to CPU device
+
+            core = openvino.Core()
+            gpu_device_name = core.get_property("GPU", "FULL_DEVICE_NAME")
+            logger.info(f"OVVisionGenerativeModel - loading - confirmed GPU device name: "
+                           f"{gpu_device_name}")
+            device = "GPU"
+
+        except:
+
+            logger.info("OVVisionGenerativeModel - loading - could not find GPU - setting device for CPU")
+            device = "CPU"
+
+        return device
+
+    def load_ov_external_tokenizer(self):
+
+        """ Called in class constructor if OVConfig flag set to 'get_output_counts',
+        and will create a local instance of the tokenizer used to get the counts. """
+
+        if "tokenizer_local" in self.model_card:
+            tok_local_name = self.model_card["tokenizer_local"]
+            self.tokenizer = LocalTokenizer(tokenizer_fn=tok_local_name)
+        else:
+            # if no tokenizer found, then falls back to default tokenizer for 'approximate' count
+            self.tokenizer = Utilities().get_default_tokenizer()
+
+    def inference(self, prompt, image_path, inference_dict=None):
+        """ Implemented as stream without a streamer function. """
+
+        return self.stream(prompt,image_path, inference_dict=inference_dict,
+                           streamer=None, no_stream=True)
+
+    def stream(self, prompt, image_path, add_context=None, add_prompt_engineering=None, api_key=None,
+                  inference_dict=None, streamer=None,no_stream=False):
+
+        """ Executes stream generation inference on model.
+
+        NOTE: operates differently than other stream methods in LLMWare -
+        the method is not a generator, but rather the streaming update is
+        provided through passing a streamer function to the OpenVINO
+        backend - which will be called at each step of the generation
+        cycle.
+
+        Sample call:
+
+            # will automatically use default streamer to print to console
+            response = model.stream('Describe this image', 'C:\\Users\\...')
+
+            # pass a custom streaming function
+            response = model.stream('Describe this image' 'C:\\Users\\...', streamer=my_streamer)
+
+        Streamer function example: .ov_default_streamer in this model class
+
+        """
+
+        # first prepare the prompt
+        self.prompt = prompt
+
+        if inference_dict:
+
+            if "temperature" in inference_dict:
+                self.temperature = inference_dict["temperature"]
+
+            if "max_tokens" in inference_dict:
+                self.target_requested_output_tokens = inference_dict["max_tokens"]
+
+        self.preview()
+
+        text_prompt = self.prompt
+
+        #   counts the input tokens
+        if self.get_token_counts:
+            self.input_token_count = self.ov_token_counter(text_prompt)
+        else:
+            self.input_token_count = 0
+
+        time_start = time.time()
+
+        # prepares the image as tensor
+        from PIL import Image
+        pic = Image.open(image_path).convert("RGB")
+        image_data = np.array(pic)[None]
+        images = [openvino.Tensor(image_data)]
+
+        #   main call to inner generate function
+        if not streamer and not no_stream:
+            streamer = self.ov_default_streamer
+
+        output = self._generate_ov_genai(text_prompt,
+                                         image=images,
+                                         streamer=streamer)
+
+        output_str = output
+
+        self.output_token_count = 0
+
+        usage = {"input": self.input_token_count,
+                 "output": self.output_token_count,
+                 "total": self.input_token_count + self.output_token_count,
+                 "metric": "tokens",
+                 "processing_time": time.time() - time_start}
+
+        output_response = {"llm_response": output_str, "usage": usage}
+
+        self.get_logits = False
+
+        # output inference parameters
+        self.llm_response = output_str
+        self.usage = usage
+        self.final_prompt = text_prompt
+
+        self.register()
+
+        return output_response
+
+    def ov_token_counter(self, text):
+
+        """ Called twice in inference generation loop to get the input_token_count and
+        output_token_count.   This step can be skipped by setting the OVConfig as follows:
+
+        `from llmware.configs import OVConfig
+        OVConfig().set_config("get_token_counts", False)`
+
+        In our testing, the performance impact is negligible, but may be different in your
+        environment and use case.
+
+        If this is set to False, then no token counts will be provided in the usage totals.
+        """
+
+        if self.tokenizer:
+            toks = len(self.tokenizer.encode(text))
+        else:
+            toks = 0
+
+        return toks
+
+    def prompt_engineer(self, query, context, inference_dict):
+        """ Implemented by openvino_genai module """
+        pass
+
+    def _generate_ov_genai(self, prompt, image=None, streamer=None):
+
+        """ Core generation script provided by generation loop exposed in the OpenVino_GenAI library. """
+
+        global ovg
+
+        config = ovg.GenerationConfig()
+        config.max_new_tokens = self.max_output
+
+        self.sample=False
+        self.temperature =0.0
+
+        #   prevent error in generation if sampling True and temperature is set to 0.0
+        if self.sample and self.temperature == 0.0:
+            self.temperature = 0.2
+            logger.warning(f"OVVisionGenerativeModel - since sample is set to True, adjusting "
+                           f"temperature from 0.0 to small value - 0.2 - to avoid error "
+                           f"in the generation loop.")
+
+        config.temperature = self.temperature
+        config.do_sample = self.sample
+
+        logger.info("OVVisionGenerativeModel - _generate_ov_genai - "
+                    f"do_sample is {self.sample} with temperature - {self.temperature}")
+
+        #   core generation step - runs generation loop on pipe with prompt and config
+
+        if image:
+            output = self.pipe.generate(prompt,image,config, streamer=streamer)
+        else:
+            if streamer:
+                output = self.pipe.generate(prompt, config, streamer=streamer)
+            else:
+                output = self.pipe.generate(prompt, config)
+
+        # need to unpack the output
+        text_output = ""
+
+        if output:
+            if hasattr(output, "texts"):
+                text_output = output.texts
+
+        return text_output
+
+    @staticmethod
+    def ov_default_streamer(x):
+
+        """ Stream to console - used by default in stream method -
+        can be over-ridden by passing a custom streaming function to
+        the stream generate call. """
+
+        print(x, end="", flush=True)
+        return ovg.StreamingStatus.RUNNING
+
+    def unload_model(self):
+
+        """ Resetting the pipe removes pointer to pipeline in Python, and generally triggers a (safe) release of
+        the memory.   WIP - will continue to evaluate effectiveness across use patterns and platforms. """
+
+        self.pipe = None
+
+        return True
 
 
 class OpenChatModel(BaseModel):
@@ -5239,7 +6318,8 @@ class OpenAIGenModel(BaseModel):
 
     """ OpenAIGenModel class implements the OpenAI API for its generative decoder models. """
 
-    def __init__(self, model_name=None, api_key=None, context_window=4000, max_output=100,temperature=0.7, **kwargs):
+    def __init__(self, model_name=None, api_key=None, context_window=32768,
+                 max_output=1000,temperature=0.0, **kwargs):
 
         super().__init__(**kwargs)
 
@@ -5267,33 +6347,43 @@ class OpenAIGenModel(BaseModel):
         if temperature >= 0.0:
             self.temperature = temperature
         else:
-            self.temperature = 0.7
+            self.temperature = 0.0
 
         self.target_requested_output_tokens = max_output
         self.add_prompt_engineering = False
         self.add_context = ""
         self.prompt = ""
+        self.context = ""
+
+        # provides option to pass custom openai_client to model class at inference time
+        self.openai_client = None
+
+        if "model_card" in kwargs:
+            self.model_card = kwargs["model_card"]
+        else:
+            self.model_card = {}
 
         self.post_init()
 
-    def set_api_key (self, api_key, env_var="USER_MANAGED_OPENAI_API_KEY"):
+    def set_api_key (self, api_key, env_var="OPENAI_API_KEY"):
 
         """ Utility method to set the API key in os.environ variable. """
 
         # set api_key
         os.environ[env_var] = api_key
-        logger.info("update: added and stored OpenAI api_key in environmental variable- %s", env_var)
+        logger.info(f"OpenAIGenModel - added and stored OpenAI api_key in environmental variable- {env_var}")
 
         return self
 
-    def _get_api_key (self, env_var="USER_MANAGED_OPENAI_API_KEY"):
+    def _get_api_key (self, env_var="OPENAI_API_KEY"):
 
         """ Utility method to get the API key from os.environ variable. """
 
         self.api_key = os.environ.get(env_var)
 
         if not self.api_key:
-            logger.error("error: _get_api_key could not successfully retrieve value from: %s ", env_var)
+            logger.error(f"OpenAIGenModel - _get_api_key could not successfully retrieve "
+                         f"value from: {env_var}")
 
         return self.api_key
 
@@ -5385,15 +6475,24 @@ class OpenAIGenModel(BaseModel):
             if "openai_client" in inference_dict:
                 self.openai_client = inference_dict["openai_client"]
 
+        from llmware.configs import OpenAIConfig
+
+        if not self.openai_client:
+            azure_client = OpenAIConfig().get_azure_client()
+        else:
+            azure_client = self.openai_client
+
         # api_key
         if api_key:
             self.api_key = api_key
 
         if not self.api_key:
-            self.api_key = self._get_api_key()
+            if not azure_client:
+                self.api_key = self._get_api_key()
 
-        if not self.api_key:
-            logger.error("error: invoking OpenAI Generative model with no api_key")
+        if not self.api_key and not azure_client:
+            raise LLMWareException(message="OpenAIGenModel: no api_key found for OpenAI. This can be set as "
+                                           "an environment variable with: os.environ['OPENAI_API_KEY'] = '...'")
 
         #   call to preview hook (not implemented by default)
         self.preview()
@@ -5401,45 +6500,244 @@ class OpenAIGenModel(BaseModel):
         # default case - pass the prompt received without change
         prompt_enriched = self.prompt
 
-        # new - change with openai v1 api
         try:
             from openai import OpenAI
         except ImportError:
             raise DependencyNotInstalledException("openai >= 1.0")
-
-        from llmware.configs import OpenAIConfig
 
         usage = {}
         time_start = time.time()
 
         try:
 
-            if self.model_name in ["gpt-3.5-turbo","gpt-4","gpt-4-1106-preview","gpt-3.5-turbo-1106", 
-                                   "gpt-4-0125-preview", "gpt-3.5-turbo-0125", "gpt-4o", "gpt-4o-2024-05-13"]:
+            if self.model_name in ["gpt-4o", "o4-mini"]:
+
+                # PATH #1 - the new 'responses' endpoint
 
                 messages = self.prompt_engineer_chatgpt3(prompt_enriched, self.add_context, inference_dict)
 
                 # updated OpenAI client to >v1.0 API - create client, and returns pydantic objects
 
-                azure_client = OpenAIConfig().get_azure_client()
-
                 if not azure_client:
                     client = OpenAI(api_key=self.api_key)
-
+                    model_name = self.model_name
                 else:
-
-                    logger.info("update: applying custom OpenAI client from OpenAIConfig")
+                    logger.debug("OpenAIGenModel - applying custom OpenAI client from OpenAIConfig")
 
                     client = azure_client
 
-                response = client.chat.completions.create(model=self.model_name,messages=messages,
-                                                          max_tokens=self.target_requested_output_tokens)
+                    # adapt model name for azure, e.g., replace(".", "")
+                    model_name = OpenAIConfig().get_azure_model_name(self.model_name)
+
+                response = client.responses.create(model=model_name,input=messages,)
+
+                text_out = response.output_text
+
+                usage = {"input": response.usage.input_tokens,
+                         "output": response.usage.output_tokens,
+                         "total": response.usage.total_tokens,
+                         "metric": "tokens",
+                         "processing_time": time.time() - time_start}
+
+            elif self.model_name in ["gpt-5.2-pro", "gpt-5.2", "gpt-5-mini", "gpt-5-nano", "gpt-4.1"]:
+
+                # PATH #2 - 'main' chatgpt-style chat completions endpoint
+
+                messages = self.prompt_engineer_chatgpt3(prompt_enriched, self.add_context, inference_dict)
+
+                # updated OpenAI client to >v1.0 API - create client, and returns pydantic objects
+
+                if not azure_client:
+                    client = OpenAI(api_key=self.api_key)
+                    model_name = self.model_name
+
+                else:
+
+                    logger.debug("OpenAIGenModel - applying custom OpenAI client from OpenAIConfig")
+
+                    client = azure_client
+
+                    # adapt model name for azure, e.g., replace(".", "")
+                    model_name = OpenAIConfig().get_azure_model_name(self.model_name)
+
+                # note: max_tokens deprecated for max_output_tokens -> but not supported for 'o' models
+
+                response = client.chat.completions.create(model=model_name, messages=messages)
 
                 text_out = response.choices[0].message.content
 
                 usage = {"input": response.usage.prompt_tokens,
                          "output": response.usage.completion_tokens,
                          "total": response.usage.total_tokens,
+                         "metric": "tokens",
+                         "processing_time": time.time() - time_start}
+
+            else:
+
+                # PATH #3 - openai traditional 'instruct gpt' completion models
+
+                prompt_enriched = self.prompt_engineer(prompt_enriched, self.add_context, inference_dict=inference_dict)
+
+                prompt_final = prompt_enriched
+
+                text_prompt = prompt_final + self.separator
+
+                azure_client = OpenAIConfig().get_azure_client()
+
+                if not azure_client:
+                    client = OpenAI(api_key=self.api_key)
+                    model_name = self.model_name
+                else:
+
+                    logger.debug("OpenAIGenModel - applying custom OpenAI client from OpenAIConfig")
+
+                    client = azure_client
+                    # adapt model name for azure, e.g., replace(".", "")
+                    model_name = OpenAIConfig().get_azure_model_name(self.model_name)
+
+                response = client.completions.create(model=model_name, prompt=text_prompt,
+                                                     temperature=self.temperature,
+                                                     max_tokens=self.target_requested_output_tokens)
+
+                text_out = response.choices[0].text
+
+                usage = {"input": response.usage.prompt_tokens,
+                         "output": response.usage.completion_tokens,
+                         "total": response.usage.total_tokens,
+                         "metric": "tokens",
+                         "processing_time": time.time() - time_start}
+
+        except Exception as e:
+            # catch error
+            text_out = "/***ERROR***/"
+            usage = {"input":0, "output":0, "total":0, "metric": "tokens",
+                     "processing_time": time.time() - time_start}
+
+            logger.error(f"OpenAIGenModel - inference produced error - {e}")
+
+        output_response = {"llm_response": text_out, "usage": usage}
+
+        # output inference parameters
+        self.llm_response = text_out
+        self.usage = usage
+        self.logits = None
+        self.output_tokens = None
+        self.final_prompt = prompt_enriched
+
+        self.register()
+
+        return output_response
+
+    def stream(self, prompt, add_context=None, add_prompt_engineering=None, inference_dict=None,
+                  api_key=None):
+
+        """ Executes stream inference on OpenAI Model.
+
+        Only required input is text-based prompt, with optional
+        parameters to "add_context" passage that will be assembled using the prompt style in the
+        "add_prompt_engineering" parameter.  Optional inference_dict for temperature and max_tokens configuration,
+        and optional passing of api_key at time of inference.
+        """
+
+        self.prompt = prompt
+
+        if add_context:
+            self.add_context = add_context
+
+        if add_prompt_engineering:
+            self.add_prompt_engineering = add_prompt_engineering
+
+        if inference_dict:
+
+            if "temperature" in inference_dict:
+                self.temperature = inference_dict["temperature"]
+
+            if "max_tokens" in inference_dict:
+                self.target_requested_output_tokens = inference_dict["max_tokens"]
+
+            if "openai_client" in inference_dict:
+                self.openai_client = inference_dict["openai_client"]
+
+        from llmware.configs import OpenAIConfig
+
+        if not self.openai_client:
+            azure_client = OpenAIConfig().get_azure_client()
+        else:
+            azure_client = self.openai_client
+
+        # api_key
+        if api_key:
+            self.api_key = api_key
+
+        if not self.api_key:
+            if not azure_client:
+                self.api_key = self._get_api_key()
+
+        if not self.api_key and not azure_client:
+            raise LLMWareException(message="OpenAIGenModel: no api_key found for OpenAI. This can be set as "
+                                           "an environment variable with: os.environ['OPENAI_API_KEY'] = '...'")
+
+        #   call to preview hook (not implemented by default)
+        self.preview()
+
+        # default case - pass the prompt received without change
+        prompt_enriched = self.prompt
+
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise DependencyNotInstalledException("openai >= 1.0")
+
+        usage = {}
+        time_start = time.time()
+
+        try:
+
+            if self.model_name in ["o1-pro", "o3-mini"]:
+
+                # PATH #1 - the new 'responses' endpoint -> streaming not implemented yet
+
+                raise LLMWareException(message=f"Responses API streaming not implemented for this model.  To use "
+                                               f"{self.model_name}, please use the .inference method")
+
+            elif self.model_name in ["gpt-5.2-pro", "gpt-5.2", "gpt-5-mini", "gpt-5-nano", "gpt-4.1"]:
+
+                messages = self.prompt_engineer_chatgpt3(prompt_enriched, self.add_context, inference_dict)
+
+                # updated OpenAI client to >v1.0 API - create client, and returns pydantic objects
+
+                if not azure_client:
+                    client = OpenAI(api_key=self.api_key)
+                    model_name = self.model_name
+
+                else:
+
+                    logger.debug("OpenAIGenModel - applying custom OpenAI client from OpenAIConfig.")
+
+                    client = azure_client
+
+                    # adapt model name for azure, e.g., replace(".", "")
+                    model_name = OpenAIConfig().get_azure_model_name(self.model_name)
+
+                text_out = ""
+                prompt_tokens = 0
+                completion_tokens = 0
+                total_tokens = 0
+
+                stream_response = client.chat.completions.create(model=model_name,messages=messages,
+                                                                 # max_tokens=self.target_requested_output_tokens,
+                                                                 stream=True)
+
+                # implement streaming generator to yield chunk of tokens
+                for chunk in stream_response:
+                    if len(chunk.choices) > 0:
+                        token = chunk.choices[0].delta.content or ""
+                        text_out += token
+                        yield token
+
+                usage = {"input": prompt_tokens,
+                         "output": completion_tokens,
+                         "total": prompt_tokens + completion_tokens,
                          "metric": "tokens",
                          "processing_time": time.time() - time_start}
 
@@ -5456,32 +6754,45 @@ class OpenAIGenModel(BaseModel):
 
                 if not azure_client:
                     client = OpenAI(api_key=self.api_key)
+                    model_name = self.model_name
 
                 else:
 
-                    logger.info("update: applying custom OpenAI client from OpenAIConfig")
+                    logger.debug("OpenAIGenModel - applying custom OpenAI client from OpenAIConfig.")
 
                     client = azure_client
+                    model_name = OpenAIConfig().get_azure_model_name(self.model_name)
 
-                response = client.completions.create(model=self.model_name, prompt=text_prompt,
-                                                     temperature=self.temperature,
-                                                     max_tokens=self.target_requested_output_tokens)
+                text_out = ""
+                prompt_tokens = 0
+                completion_tokens = 0
+                total_tokens = 0
 
-                text_out = response.choices[0].text
+                stream_response = client.completions.create(model=model_name, prompt=text_prompt,
+                                                            temperature=self.temperature,
+                                                            max_tokens=self.target_requested_output_tokens,
+                                                            stream=True)
 
-                usage = {"input": response.usage.prompt_tokens,
-                         "output": response.usage.completion_tokens,
-                         "total": response.usage.total_tokens,
+                # implement streaming generator to yield chunk of tokens
+                for chunk in stream_response:
+                    if len(chunk.choices) > 0:
+                        token = chunk.choices[0].delta.content or ""
+                        text_out += token
+                        yield token
+
+                usage = {"input": prompt_tokens,
+                         "output": completion_tokens,
+                         "total": prompt_tokens + completion_tokens,
                          "metric": "tokens",
                          "processing_time": time.time() - time_start}
 
         except Exception as e:
-            # this is special error code that will be picked and handled in AIModels().inference handler
+            # catch error
             text_out = "/***ERROR***/"
             usage = {"input":0, "output":0, "total":0, "metric": "tokens",
                      "processing_time": time.time() - time_start}
 
-            logger.error("error: OpenAI model inference produced error - %s ", e)
+            logger.error(f"OpenAIGenModel - OpenAI model inference produced error - {e}")
 
         output_response = {"llm_response": text_out, "usage": usage}
 
@@ -5501,7 +6812,8 @@ class ClaudeModel(BaseModel):
 
     """ ClaudeModel class implements the Anthropic Claude API for calling Anthropic models. """
 
-    def __init__(self, model_name=None, api_key=None, context_window=8000, max_output=100, temperature=0.7, **kwargs):
+    def __init__(self, model_name=None, api_key=None, context_window=32768,
+                 max_output=1000, temperature=0.0, **kwargs):
 
         super().__init__(**kwargs)
 
@@ -5514,6 +6826,10 @@ class ClaudeModel(BaseModel):
         self.final_prompt = None
 
         self.api_key = api_key
+
+        if not api_key:
+            self.api_key = api_key
+
         self.model_name = model_name
 
         self.error_message = "\nUnable to connect to Anthropic/Claude. Please try again later."
@@ -5529,32 +6845,39 @@ class ClaudeModel(BaseModel):
         if temperature >= 0.0:
             self.temperature = temperature
         else:
-            self.temperature = 0.7
+            self.temperature = 0.0
 
         self.target_requested_output_tokens = max_output
         self.add_prompt_engineering = False
         self.add_context = ""
         self.prompt = ""
+        self.instruction_following = False
+        self.prompt_wrapper = None
+
+        if "model_card" in kwargs:
+            self.model_card = kwargs["model_card"]
+        else:
+            self.model_card = {}
 
         self.post_init()
 
-    def set_api_key(self, api_key, env_var="USER_MANAGED_ANTHROPIC_API_KEY"):
+    def set_api_key(self, api_key, env_var="ANTHROPIC_API_KEY"):
 
         """ Utility method to set the API key in os.environ variable. """
 
         os.environ[env_var] = api_key
-        logger.info("update: added and stored ANTHROPIC api_key in environmental variable- %s", env_var)
+        logger.info(f"ClaudeModel - added and stored ANTHROPIC api_key in environmental variable- {env_var}")
 
         return self
 
-    def _get_api_key(self, env_var="USER_MANAGED_ANTHROPIC_API_KEY"):
+    def _get_api_key(self, env_var="ANTHROPIC_API_KEY"):
 
         """ Utility method to get api_key from os.environ variable. """
 
         self.api_key = os.environ.get(env_var)
 
         if not self.api_key:
-            logger.error("error: _get_api_key could not successfully retrieve value from: %s ", env_var)
+            logger.error(f"ClaudeModel - _get_api_key could not successfully retrieve value from: {env_var}")
 
         return self.api_key
 
@@ -5566,13 +6889,34 @@ class ClaudeModel(BaseModel):
         toks = tokenizer.encode(text_sample).ids
         return len(toks)
 
-    def prompt_engineer (self, query, context, inference_dict=None):
+    def prompt_engineer(self, query, context, inference_dict=None):
 
-        """ Builds prompt by assembling query, context and applying prompt style. """
+        self.instruction_following = False
+        self.prompt_wrapper = False
 
-        # default case -> prompt = input query
+        # new
+        system_instruction = None
+        if inference_dict:
+            if "system_instruction" in inference_dict:
+                system_instruction = inference_dict["system_instruction"]
+        # end - new
 
-        prompt_engineered = ""
+        # if loaded model was not pretrained on instruction_following, then skip any instructions
+        if not self.instruction_following:
+
+            if context:
+                output = context + "\n" + query
+            else:
+                output = query
+
+            # unlikely that there would be an 'instruct wrapping' on text, but allow for possibility
+            if self.prompt_wrapper:
+                output = PromptCatalog().apply_prompt_wrapper(output, self.prompt_wrapper,
+                                                              instruction=system_instruction)
+
+            return output
+
+        # move ahead to add instructions and prompt engineering
 
         if not self.add_prompt_engineering:
             if context:
@@ -5584,18 +6928,26 @@ class ClaudeModel(BaseModel):
 
         prompt_dict = PromptCatalog().build_core_prompt(prompt_name=selected_prompt,
                                                         separator=self.separator,
-                                                        query=query,context=context,
+                                                        query=query,
+                                                        context=context,
                                                         inference_dict=inference_dict)
 
         if prompt_dict:
+            prompt_engineered = prompt_dict["core_prompt"]
+        else:
+            # default case
+            prompt_engineered = "Please read the following text: " + context + self.separator
+            prompt_engineered += "Based on this text, please answer the question: " + query + self.separator
+            prompt_engineered += "Please answer the question only with facts provided in the materials.  " \
+                                 "If the question can not be answered in the materials, then please " \
+                                 "respond 'Not Found.'"
 
-            core_prompt = prompt_dict["core_prompt"]
+        #   final wrapping, based on model-specific instruct training format
+        #   --provides a final 'wrapper' around the core prompt text, based on model expectations
 
-            # prototype prompt for Anthropic:
-            # "\n\nHuman:" + {text} + "\n\nAssistant:"
-            # per Anthropic docs, usually best to include the query at the END, rather than the Beginning
-
-            prompt_engineered = "\n\nHuman: " + core_prompt + "\n\nAssistant:"
+        if self.prompt_wrapper:
+            prompt_engineered = PromptCatalog().apply_prompt_wrapper(prompt_engineered, self.prompt_wrapper,
+                                                                     instruction=None)
 
         return prompt_engineered
 
@@ -5630,7 +6982,8 @@ class ClaudeModel(BaseModel):
             self.api_key = self._get_api_key()
 
         if not self.api_key:
-            logger.error("error: invoking Anthropic Claude Generative model with no api_key")
+            raise LLMWareException(message=f"ClaudeModel - no api key found - you can set with: "
+                                           f"os.environ['ANTHROPIC_API_KEY'] = '...'")
 
         #   call to preview hook (not implemented by default)
         self.preview()
@@ -5642,46 +6995,20 @@ class ClaudeModel(BaseModel):
 
         client = anthropic.Client(api_key=self.api_key)
 
-        # prototype prompt sample:   prompt_enriched = "\n\nHuman:" + " please read the following- " +
-        # self.add_context + " Based on these materials, " + prompt["prompt"] + "\n\nAssistant:"
-
         prompt_enriched = self.prompt_engineer(self.prompt,self.add_context, inference_dict=inference_dict)
-
-        # preferred model = "claude-instant-v1"
 
         time_start = time.time()
 
         try:
 
-            # new Claude 3 models use the 'messages' API
-            # please check that you have pip installed the latest anthropic python sdk
+            # use messages API - older completion api is deprecated (and removed from ClaudeModel)
 
-            if self.model_name in ["claude-3-opus-20240229", "claude-3-sonnet-20240229"]:
+            message = client.messages.create(model=self.model_name, max_tokens=self.target_requested_output_tokens,
+                                             messages=[{"role": "user", "content": prompt_enriched}] )
 
-                # use messages API
-                message = client.messages.create(model=self.model_name, max_tokens=self.target_requested_output_tokens,
-                                                 messages=[{"role": "user", "content": prompt_enriched}] )
-
-                text_out = message.content[0].text
-                input_count = message.usage.input_tokens
-                output_count = message.usage.output_tokens
-
-            else:
-
-                # use completion api for 'original' Claude models
-
-                response = client.completions.create(prompt=prompt_enriched,
-                                                    stop_sequences=[anthropic.HUMAN_PROMPT],
-                                                    max_tokens_to_sample=self.target_requested_output_tokens,
-                                                    model=self.model_name,
-                                                    stream=False,
-                                                    temperature=self.temperature)
-
-                #text_out = list(response)[-1].completion
-                text_out = response.completion
-
-                input_count = client.count_tokens(prompt_enriched)
-                output_count = client.count_tokens(text_out)
+            text_out = message.content[0].text
+            input_count = message.usage.input_tokens
+            output_count = message.usage.output_tokens
 
             usage = {"input": input_count, "output": output_count, "total": input_count + output_count,
                      "metric": "tokens", "processing_time": time.time() - time_start}
@@ -5692,15 +7019,14 @@ class ClaudeModel(BaseModel):
             usage = {"input":0, "output":0, "total":0, "metric": "tokens",
                      "processing_time": time.time() - time_start}
 
-            # raise LLMInferenceResponseException(e)
-            logger.error("error: Anthropic model inference produced error - %s ", e)
+            logger.error(f"ClaudeModel - inference produced error - {e}")
 
-        output_response = {"llm_response": text_out, "usage": usage}
+        output_response = {"llm_response": str(text_out), "usage": usage}
 
-        logger.debug(f"update: output_response - anthropic: {output_response}")
+        logger.debug(f"ClaudeModel - output_response - {output_response}")
 
         # output inference parameters
-        self.llm_response = text_out
+        self.llm_response = str(text_out)
         self.usage = usage
         self.logits = None
         self.output_tokens = None
@@ -5710,111 +7036,13 @@ class ClaudeModel(BaseModel):
 
         return output_response
 
+    def stream(self, prompt, add_context=None, add_prompt_engineering=None, inference_dict=None,
+               api_key=None):
 
-class GoogleGenModel(BaseModel):
-
-    """ GoogleGenModel class implements the Google Vertex API for Google's generative models.
-    Note: to use GoogleModels does require a separate import of Google SDKs - vertexai and google.cloud.platform """
-
-    def __init__(self, model_name=None, api_key=None, context_window=8192, max_output=100, temperature=0.7, **kwargs):
-
-        super().__init__(**kwargs)
-
-        self.model_class = "GoogleGenModel"
-        self.model_category = "generative"
-        self.llm_response = None
-        self.usage = None
-        self.logits = None
-        self.output_tokens = None
-        self.final_prompt = None
-
-        self.api_key = api_key
-        self.model_name = model_name
-        self.model = None
-        self.error_message = "\nUnable to connect to Google/PALM Model. Please try again later."
-        self.separator = "\n"
-
-        # need to confirm max input and output
-        #   set max_total_len -> adjust input and output based on use case
-        self.max_total_len = context_window
-        self.max_input_len = int(context_window*0.5)
-
-        # need to check max output for Google - may be asymmetrical cap
-        self.llm_max_output_len = 1024
-
-        # inference settings
-        if temperature >= 0.0:
-            self.temperature = temperature
-        else:
-            self.temperature = 0.7
-
-        self.target_requested_output_tokens = max_output
-        self.add_prompt_engineering = False
-        self.add_context = ""
-        self.prompt = ""
-
-        self.post_init()
-
-    def set_api_key(self, api_key, env_var="USER_MANAGED_GOOGLE_API_KEY"):
-
-        """ Utility method to set the API key in os.environ variable. """
-
-        os.environ[env_var] = api_key
-        logger.info("update: added and stored GOOGLE api_key in environmental variable- %s", env_var)
-
-        return self
-
-    def _get_api_key(self, env_var="USER_MANAGED_GOOGLE_API_KEY"):
-
-        """ Utility method to get api_key from os.environ variable. """
-
-        self.api_key = os.environ.get(env_var)
-        return self.api_key
-
-    def token_counter(self, text_sample):
-
-        """ Gets GPT2 tokenizer for fast approximate token counting. """
-
-        tokenizer = Utilities().get_default_tokenizer()
-        toks = tokenizer.encode(text_sample).ids
-
-        return len(toks)
-
-    def prompt_engineer (self, query, context, inference_dict=None):
-
-        """ Builds Prompt by assembling query, context and applying the selected prompt engineering style. """
-
-        if not self.add_prompt_engineering:
-            if context:
-                selected_prompt = "default_with_context"
-            else:
-                selected_prompt = "default_no_context"
-        else:
-            selected_prompt = self.add_prompt_engineering
-
-        prompt_dict = PromptCatalog().build_core_prompt(prompt_name=selected_prompt,
-                                                        separator=self.separator,
-                                                        query=query,
-                                                        context=context,
-                                                        inference_dict=inference_dict)
-
-        if prompt_dict:
-            prompt_engineered = prompt_dict["core_prompt"]
-
-        else:
-            # default case -> prompt = input query
-            prompt_engineered = "Please read the following text: " + context + \
-                                " and answer the question: " + query
-
-        return prompt_engineered
-
-    def inference(self, prompt, add_context=None, add_prompt_engineering=None, inference_dict=None,
-                  api_key=None):
-
-        """ Executes inference on Google Model.  Only required input is text-based prompt, with optional
-        parameters to "add_context" passage that will be assembled using the prompt style in the
-        "add_prompt_engineering" parameter.  Optional inference_dict for temperature and max_tokens configuration,
-        and optional passing of api_key at time of inference. """
+        """ Executes streaming inference on Anthropic Model. Only required input is text-based prompt,
+        with optional parameters to "add_context" passage that will be assembled using the prompt style in the
+        "add_prompt_engineering" parameter.  Optional inference_dict for temperature and max_tokens
+        configuration, and optional passing of api_key at time of inference. """
 
         self.prompt = prompt
 
@@ -5832,17 +7060,6 @@ class GoogleGenModel(BaseModel):
             if "max_tokens" in inference_dict:
                 self.target_requested_output_tokens = inference_dict["max_tokens"]
 
-        #   call to preview hook (not implemented by default)
-        self.preview()
-
-        try:
-            from vertexai.preview.language_models import TextGenerationModel, TextEmbeddingModel
-            from vertexai import init
-            import google.cloud.aiplatform as aiplatform
-        except ImportError:
-            raise DependencyNotInstalledException("google-cloud-aiplatform")
-
-        # api_key
         if api_key:
             self.api_key = api_key
 
@@ -5850,55 +7067,61 @@ class GoogleGenModel(BaseModel):
             self.api_key = self._get_api_key()
 
         if not self.api_key:
-            logger.error("error: invoking Google Generative model with no api_key")
+            raise LLMWareException(message=f"ClaudeModel - no api key found - you can set with: "
+                                           f"os.environ['ANTHROPIC_API_KEY'] = '...'")
+
+        #   call to preview hook (not implemented by default)
+        self.preview()
+
+        try:
+            import anthropic
+        except ImportError:
+            raise DependencyNotInstalledException("anthropic")
+
+        client = anthropic.Client(api_key=self.api_key)
 
         prompt_enriched = self.prompt_engineer(self.prompt,self.add_context, inference_dict=inference_dict)
 
-        self.target_requested_output_tokens= 2000
-        # note: google api is not well-documented
-
         time_start = time.time()
 
         try:
 
-            # Important: Before calling the model, we need to ensure the contents of the
-            # api_key (the json dict string) have been persisted to a file
-            # and the environment variable GOOGLE_APPLICATION_CREDENTIALS points to that file path
+            # use messages API
+            message = client.messages.create(model=self.model_name, max_tokens=self.target_requested_output_tokens,
+                                             messages=[{"role": "user", "content": prompt_enriched}])
 
-            google_json_credentials = self.api_key_to_json()
-            os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = google_json_credentials
+            text_out = message.content[0].text
+            input_count = message.usage.input_tokens
+            output_count = message.usage.output_tokens
 
-            self.model = TextGenerationModel.from_pretrained("text-bison@001")
-            response = self.model.predict(prompt=prompt_enriched,
-                                          temperature=0.7)
+            text_out = ""
+            prompt_tokens = 0
+            completion_tokens = 0
 
-            logger.debug(f"google model response: {response.text}")
-         
-            text_out = response.text
+            with client.messages.stream(
+                max_tokens=self.target_requested_output_tokens,
+                messages=[{"role": "user", "content": prompt_enriched}],
+                model=self.model_name) as stream:
 
-            input_count = len(prompt_enriched)
-            output_count = len(text_out)
+                for text in stream.text_stream:
+                    # print(text, end="", flush=True)
+                    text_out += text
+                    yield text
 
             usage = {"input": input_count, "output": output_count, "total": input_count + output_count,
-                     "metric": "characters","processing_time": time.time() - time_start}
+                     "metric": "tokens", "processing_time": time.time() - time_start}
 
         except Exception as e:
-
-            # this is special error code that will be picked and handled in AIModels().inference handler
+            # this is special error code that will be picked and handled by calling function
             text_out = "/***ERROR***/"
-            usage = {"input":0, "output":0, "total":0, "metric": "characters",
+            usage = {"input": 0, "output": 0, "total": 0, "metric": "tokens",
                      "processing_time": time.time() - time_start}
 
-            # raise LLMInferenceResponseException(e)
-            logger.error("error: Google model inference produced error:  %s", e)
+            logger.error(f"ClaudeModel inference produced error - {e}")
 
-        finally:
-            # Close the credentials json which automatically deletes it (since it is a NamedTemporaryFile)
-            os.remove(google_json_credentials)
-        
         output_response = {"llm_response": text_out, "usage": usage}
 
-        logger.debug("update: output_response - google: %s ", output_response)
+        logger.debug(f"ClaudeModel - output_response - {output_response}")
 
         # output inference parameters
         self.llm_response = text_out
@@ -5910,30 +7133,19 @@ class GoogleGenModel(BaseModel):
         self.register()
 
         return output_response
-    
-    def api_key_to_json(self):
-
-        # Google authentication key is an entire json dictionary which we have the user pass in as an env var
-        # We write out the json and we need to escape newlines which seem to be always present in
-        # google auth json files
-
-        temp_json_path = tempfile.NamedTemporaryFile(prefix="googlecreds", delete=False).name
-
-        with open(temp_json_path, "w", encoding='utf-8') as f:
-            f.write(self.api_key.replace("\n", "\\n"))
-
-        return temp_json_path
 
 
-class JurassicModel(BaseModel):
+class GoogleGeminiModel(BaseModel):
 
-    """ JurassicModel class implements the AI21 Jurassic API. """
+    """ GoogleGeminiModel class implements the current Google Gemini Model
+     API for calling Google Gemini models. """
 
-    def __init__(self, model_name=None, api_key=None, context_window=2048, max_output=100,temperature=0.7, **kwargs):
+    def __init__(self, model_name=None, api_key=None, context_window=32768,
+                 max_output=1000, temperature=0.0, **kwargs):
 
         super().__init__(**kwargs)
 
-        self.model_class = "JurassicModel"
+        self.model_class = "GoogleGeminiModel"
         self.model_category = "generative"
         self.llm_response = None
         self.usage = None
@@ -5942,268 +7154,84 @@ class JurassicModel(BaseModel):
         self.final_prompt = None
 
         self.api_key = api_key
-        self.model_name = model_name
 
-        self.error_message = "\nUnable to connect to Jurassic. Please try again later."
-
-        self.separator = " -- "
-
-        #   set max_total_len -> adjust input and output based on use case
-        self.max_total_len = context_window
-        self.max_input_len = int(context_window * 0.5)
-
-        self.llm_max_output_len = int(context_window * 0.5)
-
-        # inference settings
-        if temperature >= 0.0:
-            self.temperature = temperature
-        else:
-            self.temperature = 0.7
-
-        self.target_requested_output_tokens = max_output
-        self.add_prompt_engineering = False
-        self.add_context = ""
-        self.prompt = ""
-
-        # 'j2-jumbo-instruct', 'j2-grande-instruct','j2-jumbo','j2-grande', 'j2-large'
-
-        self.post_init()
-
-    def set_api_key(self, api_key, env_var="USER_MANAGED_AI21_API_KEY"):
-
-        """ Utility method to set the API key in os.environ variable. """
-
-        os.environ[env_var] = api_key
-        logger.info("update: added and stored AI21 api_key in environmental variable- %s", env_var)
-
-        return self
-
-    def _get_api_key(self, env_var="USER_MANAGED_AI21_API_KEY"):
-
-        """ Utility method to get api_key from os.environ variable. """
-
-        self.api_key = os.environ.get(env_var)
-
-        return self.api_key
-
-    def token_counter(self, text_sample):
-
-        """ Gets GPT2 tokenizer for fast approximate token counting. """
-
-        tokenizer = Utilities().get_default_tokenizer()
-        toks = tokenizer.encode(text_sample).ids
-
-        return len(toks)
-
-    def prompt_engineer (self, query, context, inference_dict=None):
-
-        """ Builds prompt by assembling query, context and applying the selected prompt style. """
-
-        if not self.add_prompt_engineering:
-            if context:
-                selected_prompt = "default_with_context"
-            else:
-                selected_prompt = "default_no_context"
-        else:
-            selected_prompt = self.add_prompt_engineering
-
-        prompt_dict = PromptCatalog().build_core_prompt(prompt_name=selected_prompt,
-                                                        separator=self.separator,
-                                                        query=query,
-                                                        context=context,
-                                                        inference_dict=inference_dict)
-
-        if prompt_dict:
-            prompt_engineered = prompt_dict["core_prompt"]
-        else:
-
-            # default case
-            prompt_engineered = "Please read the following text: " + context + " -- "
-            prompt_engineered += " ## "
-            prompt_engineered += "Please answer the following question based on the text: " + query
-            prompt_engineered += " ## "
-
-        return prompt_engineered
-
-    def inference(self, prompt, add_context=None, add_prompt_engineering=None, inference_dict=None,
-                  api_key=None):
-
-        """ Executes inference on Jurassic Model.  Only required input is text-based prompt, with optional
-        parameters to "add_context" passage that will be assembled using the prompt style in the
-        "add_prompt_engineering" parameter.  Optional inference_dict for temperature and max_tokens configuration,
-        and optional passing of api_key at time of inference. """
-
-        self.prompt = prompt
-
-        if add_context:
-            self.add_context = add_context
-
-        if add_prompt_engineering:
-            self.add_prompt_engineering = add_prompt_engineering
-
-        if inference_dict:
-
-            if "temperature" in inference_dict:
-                self.temperature = inference_dict["temperature"]
-
-            if "max_tokens" in inference_dict:
-                self.target_requested_output_tokens = inference_dict["max_tokens"]
-
-        if api_key:
+        if not api_key:
             self.api_key = api_key
 
-        if not self.api_key:
-            self.api_key = self._get_api_key()
-
-        if not self.api_key:
-            logger.error("error: invoking AI21 Jurassic model with no api_key")
-
-        #   call to preview hook (not implemented by default)
-        self.preview()
-
-        try:
-            import ai21
-        except ImportError:
-            raise DependencyNotInstalledException("ai21")
-
-        prompt_enriched = self.prompt
-
-        prompt_enriched = self.prompt_engineer(prompt_enriched,self.add_context, inference_dict=inference_dict)
-
-        time_start = time.time()
-
-        try:
-            ai21.api_key = self.api_key
-
-            response = ai21.Completion.execute(
-                model=self.model_name,
-                prompt=prompt_enriched,
-                numResults=1,
-                maxTokens=self.target_requested_output_tokens,
-                temperature=0.7,
-                topKReturn=0,
-                topP=1,
-                stopSequences=["##"]
-                )
-
-            # api parameters: {"prompt", "numResults", "maxTokens", "minTokens", "temperature", "topP",
-            #   "stopSequences" = list of sequences that when generated will cause the model to stop
-            #   "topKReturn" = number of top scoring tokens to consider in each generation step
-            #   "frequencyPenalty" = penalty applied to frequently generated tokens
-            #   "presencePenalty" =  penalty applied to tokens already present in the prompt.
-            #   "countPenalty" = penalty applied to tokens based on frequency in the generated responses.
-
-            text_out = response["completions"][0]["data"]["text"]
-
-            usage = {"input": len(prompt_enriched), "output": len(text_out),
-                     "total": len(prompt_enriched) + len(text_out), "metric": "chars",
-                     "processing_time": time.time() - time_start}
-
-        except Exception as e:
-
-            # this is special error code that will be picked and handled in inference handler
-
-            text_out = "/***ERROR***/"
-
-            usage = {"input": 0, "output": 0, "total": 0, "metric": "chars",
-                     "processing_time": time.time() - time_start}
-
-            # raise LLMInferenceResponseException(e)
-            logger.error("error: Jurassic model inference produced error - %s ", e)
-
-        # will look to capture usage metadata
-
-        output_response = {"llm_response": text_out, "usage": usage}
-
-        # output inference parameters
-        self.llm_response = text_out
-        self.usage = usage
-        self.logits = None
-        self.output_tokens = None
-        self.final_prompt = prompt_enriched
-
-        self.register()
-
-        return output_response
-
-
-class CohereGenModel(BaseModel):
-
-    """ CohereGenModel class implements the API for Cohere's generative models. """
-
-    def __init__(self, model_name=None, api_key=None, context_window=2048, max_output=100,temperature=0.7, **kwargs):
-
-        super().__init__(**kwargs)
-
-        self.model_class = "CohereGenModel"
-        self.model_category = "generative"
-        self.llm_response = None
-        self.usage = None
-        self.logits = None
-        self.output_tokens = None
-        self.final_prompt = None
-
-        self.api_key = api_key
         self.model_name = model_name
 
-        self.error_message = "\nUnable to connect to Cohere. Please try again later."
+        self.error_message = "\nUnable to connect to Google Gemini. Please try again later."
 
-        self.separator = " -- "
+        self.separator = "\n"
 
-        #   set max_total_len -> adjust input and output based on use case
-        #   confirmed - Cohere generation models - 2048 max context window
+        #   Google Gemini model - 8000 max token context window
         self.max_total_len = context_window
         self.max_input_len = int(context_window * 0.5)
-
         self.llm_max_output_len = int(context_window * 0.5)
 
         # inference settings
         if temperature >= 0.0:
             self.temperature = temperature
         else:
-            self.temperature = 0.7
+            self.temperature = 0.0
 
         self.target_requested_output_tokens = max_output
         self.add_prompt_engineering = False
         self.add_context = ""
         self.prompt = ""
-
-        # cohere generative models - 'command-medium-nightly',
-        # 'command-xlarge-nightly','xlarge','medium', "summarize-xlarge", "summarize-medium"
+        self.instruction_following = False
+        self.prompt_wrapper = None
 
         self.post_init()
 
-    def set_api_key(self, api_key, env_var="USER_MANAGED_COHERE_API_KEY"):
+    def set_api_key(self, api_key, env_var="GEMINI_API_KEY"):
 
         """ Utility method to set the API key in os.environ variable. """
 
         os.environ[env_var] = api_key
-        logger.info("update: added and stored COHERE api_key in environmental variable- %s", env_var)
+        logger.info(f"GoogleGeminiModel - added and stored GOOGLE GEMINI api_key in "
+                    f"environmental variable - {env_var}")
 
         return self
 
-    def _get_api_key(self, env_var="USER_MANAGED_COHERE_API_KEY"):
+    def _get_api_key(self, env_var="GEMINI_API_KEY"):
 
         """ Utility method to get api_key from os.environ variable. """
 
         self.api_key = os.environ.get(env_var)
 
+        if not self.api_key:
+            logger.error(f"GoogleGeminiModel - _get_api_key could not successfully "
+                         f"retrieve value from: {env_var}")
+
         return self.api_key
 
-    def token_counter(self, text_sample):
+    def prompt_engineer(self, query, context, inference_dict=None):
 
-        """ Gets GPT2 tokenizer for fast approximate token counting. """
+        self.instruction_following = False
+        self.prompt_wrapper = False
 
-        tokenizer = Utilities().get_default_tokenizer()
-        toks = tokenizer.encode(text_sample).ids
+        system_instruction = None
+        if inference_dict:
+            if "system_instruction" in inference_dict:
+                system_instruction = inference_dict["system_instruction"]
 
-        return len(toks)
+        # if loaded model was not pretrained on instruction_following, then skip any instructions
+        if not self.instruction_following:
 
-    def prompt_engineer (self, query, context, inference_dict=None):
+            if context:
+                output = context + "\n" + query
+            else:
+                output = query
 
-        """ Builds prompt by assembling query, context and applying the selected prompt style. """
+            # unlikely that there would be an 'instruct wrapping' on text, but allow for possibility
+            if self.prompt_wrapper:
+                output = PromptCatalog().apply_prompt_wrapper(output, self.prompt_wrapper,
+                                                              instruction=system_instruction)
 
-        # Cohere prompt prototype - very simple - uses " -- " as separators - does not like " " at the end
+            return output
+
+        # move ahead to add instructions and prompt engineering
 
         if not self.add_prompt_engineering:
             if context:
@@ -6223,18 +7251,25 @@ class CohereGenModel(BaseModel):
             prompt_engineered = prompt_dict["core_prompt"]
         else:
             # default case
-            prompt_engineered = "Please read the following materials: " + context + self.separator
-            prompt_engineered += "Please answer the following question: " + query + self.separator
+            prompt_engineered = "Please read the following text: " + context + self.separator
+            prompt_engineered += "Based on this text, please answer the question: " + query + self.separator
             prompt_engineered += "Please answer the question only with facts provided in the materials.  " \
                                  "If the question can not be answered in the materials, then please " \
                                  "respond 'Not Found.'"
 
+        #   final wrapping, based on model-specific instruct training format
+        #   --provides a final 'wrapper' around the core prompt text, based on model expectations
+
+        if self.prompt_wrapper:
+            prompt_engineered = PromptCatalog().apply_prompt_wrapper(prompt_engineered, self.prompt_wrapper,
+                                                                     instruction=None)
+
         return prompt_engineered
 
     def inference(self, prompt, add_context=None, add_prompt_engineering=None, inference_dict=None,
                   api_key=None):
 
-        """ Executes inference on Cohere Model.  Only required input is text-based prompt, with optional
+        """ Executes inference on Google Gemini Model.  Only required input is text-based prompt, with optional
         parameters to "add_context" passage that will be assembled using the prompt style in the
         "add_prompt_engineering" parameter.  Optional inference_dict for temperature and max_tokens configuration,
         and optional passing of api_key at time of inference. """
@@ -6255,17 +7290,119 @@ class CohereGenModel(BaseModel):
             if "max_tokens" in inference_dict:
                 self.target_requested_output_tokens = inference_dict["max_tokens"]
 
+        if api_key:
+            self.api_key = api_key
+
+        if not self.api_key:
+            self.api_key = self._get_api_key()
+
+        if not self.api_key:
+            logger.warning("GoogleGeminiModel - inference - invoking "
+                           "Google Gemini Generative model with no api_key")
+            return False
+
         #   call to preview hook (not implemented by default)
         self.preview()
 
-        #tokens_in_prompt = self.token_counter(prompt)
-        #tokens_in_context = self.token_counter(self.add_context)
+        try:
+            from google import genai
+            from google.genai import types
 
-        prompt_enriched = self.prompt
+        except ImportError:
+            raise DependencyNotInstalledException("google")
 
-        logger.debug(f"Cohere Model - inference - {prompt_enriched} - {self.add_prompt_engineering}")
+        client = genai.Client(
+            api_key=self.api_key,
+            http_options=types.HttpOptions(api_version='v1alpha')
+        )
 
-        prompt_enriched = self.prompt_engineer(prompt_enriched,self.add_context, inference_dict=inference_dict)
+        prompt_enriched = self.prompt_engineer(self.prompt,self.add_context, inference_dict=inference_dict)
+
+        time_start = time.time()
+
+        try:
+
+            response = client.models.generate_content(
+                model=self.model_name, contents=prompt_enriched)
+
+            text_out = response.text
+
+            input_count = response.usage_metadata.prompt_token_count
+            output_count = response.usage_metadata.total_token_count
+
+            usage = {"input": input_count, "output": output_count,
+                     "total": input_count + output_count,
+                     "metric": "tokens",
+                     "processing_time": time.time() - time_start}
+
+        except Exception as e:
+            # this is special error code that will be picked and handled by calling function
+            text_out = "/***ERROR***/"
+            usage = {"input":0, "output":0, "total":0, "metric": "tokens",
+                     "processing_time": time.time() - time_start}
+
+            logger.warning(f"GoogleGeminiModel - inference produced error - {e}")
+
+        output_response = {"llm_response": str(text_out), "usage": usage}
+
+        # output inference parameters
+        self.llm_response = str(text_out)
+        self.usage = usage
+        self.logits = None
+        self.output_tokens = None
+        self.final_prompt = prompt_enriched
+
+        self.register()
+
+        return output_response
+
+    def _prep_gemini_img_file(self, image_fp):
+
+        """ Utility function to prepare image for processing by Gemini """
+
+        try:
+            from google import genai
+            from google.genai import types
+
+        except ImportError:
+            raise DependencyNotInstalledException("google")
+
+        img = open(image_fp, "rb").read()
+        ext = image_fp.split(".")[-1]
+        if ext in ["jpg", "jpeg"]:
+            mime_type = "image/jpeg"
+        elif ext in ["png"]:
+            mime_type = "image/png"
+        else:
+            mime_type = "image/jpeg"
+
+        img_content = types.Part.from_bytes(data=img, mime_type=mime_type)
+
+        return img_content
+
+    def stream(self, prompt, add_context=None, add_prompt_engineering=None, inference_dict=None,
+               api_key=None, image_files=None, doc_files=None):
+
+        """ Executes streaming inference on Gemini Model. Only required input is text-based prompt,
+        with optional parameters to "add_context" passage that will be assembled using the prompt style in the
+        "add_prompt_engineering" parameter.  Optional inference_dict for temperature and max_tokens
+        configuration, and optional passing of api_key at time of inference. """
+
+        self.prompt = prompt
+
+        if add_context:
+            self.add_context = add_context
+
+        if add_prompt_engineering:
+            self.add_prompt_engineering = add_prompt_engineering
+
+        if inference_dict:
+
+            if "temperature" in inference_dict:
+                self.temperature = inference_dict["temperature"]
+
+            if "max_tokens" in inference_dict:
+                self.target_requested_output_tokens = inference_dict["max_tokens"]
 
         if api_key:
             self.api_key = api_key
@@ -6274,56 +7411,61 @@ class CohereGenModel(BaseModel):
             self.api_key = self._get_api_key()
 
         if not self.api_key:
-            logger.error(f"Cohere Model - invoking Cohere Generative model with no api_key")
+            raise LLMWareException("GoogleGeminiModel - no api_key found - you can set with: "
+                                   "os.environ['GEMINI_API_KEY'] = '...'")
+
+        #   call to preview hook (not implemented by default)
+        self.preview()
 
         try:
-            import cohere
-        except ImportError:
-            raise DependencyNotInstalledException("cohere")
+            from google import genai
+            from google.genai import types
 
-        co = cohere.Client(self.api_key)
+        except ImportError:
+            raise DependencyNotInstalledException("google")
+
+        client = genai.Client(
+            api_key=self.api_key,
+            http_options=types.HttpOptions(api_version='v1alpha')
+        )
+
+        prompt_enriched = self.prompt_engineer(self.prompt,self.add_context, inference_dict=inference_dict)
 
         time_start = time.time()
 
+        content = []
+        content.append(prompt_enriched)
+
+        if image_files:
+            for img_fp in image_files:
+                img_content = self._prep_gemini_img_file(img_fp)
+                content.append(img_content)
+
         try:
 
-            if self.model_name in ["summarize-xlarge", "summarize-medium"]:
-                # alternate - summarize api
-                response = co.summarize(text=self.add_context, model=self.model_name, length='short', temperature=0.7,
-                                        format="bullets", extractiveness='medium', additional_command=self.prompt)
+            for chunk in client.models.generate_content_stream(model=self.model_name,
+                                                               contents=content):
+                yield chunk.text
 
-                text_out = response.summary
+            text_out = ""
+            prompt_tokens = 0
+            completion_tokens = 0
 
-                usage = {"input": len(prompt_enriched), "output": len(text_out),
-                         "total": len(prompt_enriched) + len(text_out), "metric": "chars",
-                         "processing_time": time.time() - time_start}
-
-            else:
-                # generate api
-                response = co.generate(model=self.model_name, prompt=prompt_enriched,
-                                       max_tokens=self.target_requested_output_tokens, temperature=0.6,
-                                       stop_sequences=["--"])
-
-                text_out = response.generations[0].text
-
-                usage = {"input": len(prompt_enriched), "output": len(text_out),
-                         "total": len(prompt_enriched) + len(text_out), "metric": "chars",
-                         "processing_time": time.time() - time_start}
+            usage = {"input": prompt_tokens, "output": completion_tokens,
+                     "total": prompt_tokens + completion_tokens,
+                     "metric": "tokens", "processing_time": time.time() - time_start}
 
         except Exception as e:
-
+            # this is special error code that will be picked and handled by calling function
             text_out = "/***ERROR***/"
-
-            usage = {"input": 0, "output": 0, "total": 0, "metric": "chars",
+            usage = {"input": 0, "output": 0, "total": 0, "metric": "tokens",
                      "processing_time": time.time() - time_start}
 
-            logger.error("error: Cohere model inference produced error - %s - ", e)
-
-        # will look to capture usage metadata
+            logger.warning(f"GoogleGeminiModel - streaming inference produced error - {e}")
 
         output_response = {"llm_response": text_out, "usage": usage}
 
-        logger.debug("update:  output response - cohere : %s ", output_response)
+        logger.debug(f"GoogleGeminiModel - output_response - {output_response}")
 
         # output inference parameters
         self.llm_response = text_out
@@ -6335,6 +7477,543 @@ class CohereGenModel(BaseModel):
         self.register()
 
         return output_response
+
+
+class ONNXQNNGenerativeModel(BaseModel):
+
+    """ONNXQNNGenerativeModel class implements the ONNX generative model API in conjunction
+    with QNN execution provider to access NPU on Windows Arm 64.
+
+    note: this code and associated prepackaged models are pinned to the
+        following specific versions:
+
+        -- pip install onnxruntime-qnn==1.22.2
+        -- pip install onnxruntime-genai==0.9.0
+
+        ... built with qnn sdk 2.36.1
+        ... running on Windows Arm 64 Qualcomm Snapdragon NPU
+        ... does not currently support Android - but is on the roadmap
+
+    """
+
+    def __init__(self, model_name=None, api_key=None, model_card=None,
+                 prompt_wrapper=None, instruction_following=False, context_window=2048,
+                 use_gpu_if_available=True, trust_remote_code=True, sample=True, max_output=100, temperature=0.3,
+                 get_logits=False, api_endpoint=None, **kwargs):
+
+        super().__init__()
+
+        self.model_class = "ONNXQNNGenerativeModel"
+        self.model_category = "generative"
+        self.llm_response = None
+        self.usage = None
+        self.logits = None
+        self.output_tokens = None
+        self.final_prompt = None
+
+        logger.info(f"ONNXQNNGenerativeModel - starting constructor with model - {model_name}")
+
+        #   pull in expected hf input
+        self.model_name = model_name
+        self.hf_tokenizer_name = model_name
+        self.model = None
+        self.tokenizer = None
+        self.generator = None
+
+        self.sample = sample
+        self.get_logits = get_logits
+        self.auto_remediate_function_call_output = True
+
+        # Function Call parameters
+        self.model_card = model_card
+        self.logits_record = []
+        self.output_tokens = []
+        self.top_logit_count = 10
+        self.primary_keys = None
+        self.function = None
+        self.fc_supported = False
+        self.tool_type = None
+        self.npu_optimized = False
+
+        if model_card:
+
+            if "primary_keys" in model_card:
+                self.primary_keys = model_card["primary_keys"]
+
+            if "function" in model_card:
+                self.function = model_card["function"]
+
+            if "function_call" in model_card:
+                self.fc_supported = model_card["function_call"]
+
+            if "npu_optimized" in model_card:
+                self.npu_optimized = True
+
+        # instantiate if model_name passed without actual model and tokenizer
+        if model_name and not api_endpoint:
+
+            hf_repo_name = self.model_name
+
+            if not self.model_card:
+                self.model_card = ModelCatalog().lookup_model_card(self.model_name)
+
+            if self.model_card:
+                if "hf_repo" in self.model_card:
+                    hf_repo_name = self.model_card["hf_repo"]
+                    self.hf_tokenizer_name = hf_repo_name
+
+            self.model = None
+            self.tokenizer = None
+            self.tokenizer_stream = None
+
+            # set to defaults for HF models in Model Catalog
+            # this can be over-ridden post initiation if needed for custom models
+            self.prompt_wrapper = "human_bot"
+            self.instruction_following = False
+
+        self.params = None
+
+        # set specific parameters associated with custom models
+        # note - these two parameters will control how prompts are handled - model-specific
+        self.prompt_wrapper = "human_bot"
+        self.instruction_following = instruction_following
+
+        if not model_card:
+            # safety - empty iterable rather than 'None'
+            model_card = []
+
+        # deprecated attribute - will be removed in future releases
+        if "instruction_following" in model_card:
+            self.instruction_following = model_card["instruction_following"]
+        else:
+            self.instruction_following = False
+
+        if "prompt_wrapper" in model_card:
+            self.prompt_wrapper = model_card["prompt_wrapper"]
+        else:
+            self.prompt_wrapper = "human_bot"
+
+        # loads onnxruntime_genai, which in turn will look for backend qnn implementation
+        # please ensure that onnxruntime_qnn has been imported into the project
+        # onnxruntime_qnn==1.22.2
+
+        global GLOBAL_ONNX_GENAI_RUNTIME
+
+        if not GLOBAL_ONNX_GENAI_RUNTIME:
+
+            if util.find_spec("onnxruntime_genai"):
+
+                try:
+                    global og
+                    og = importlib.import_module("onnxruntime_genai")
+                    GLOBAL_ONNX_GENAI_RUNTIME = True
+                except:
+                    raise LLMWareException(message="ONNXQNNGenerativeModel: could not load onnxruntime_genai module. "
+                                                   "To fix: please check the following:\n"
+                                                   "1. pip install onnxruntime_qnn==1.22.2\n"
+                                                   "2. pip install onnxruntime_genai==0.9.0\n"
+                                                   "3. confirm Windows Arm64 with Snapdragon NPU")
+
+        #   sets trailing space default when constructing the prompt
+        #   in most cases, this is * no trailing space * but for some models, a trailing space or "\n" improves
+        #   performance
+
+        self.trailing_space = ""
+
+        if "trailing_space" in model_card:
+            self.trailing_space = model_card["trailing_space"]
+
+        self.model_type = None
+        self.config = None
+
+        # parameters on context len + output generation
+        self.max_total_len = context_window
+        self.max_input_len = int(0.5 * context_window)
+        self.llm_max_output_len = int(0.5 * context_window)
+
+        # key output parameters
+        self.max_output = max_output
+        self.target_requested_output_tokens = self.max_output
+
+        self.model_architecture = None
+        self.separator = "\n"
+
+        # use 0 as eos token id by default in generation -> but try to pull from model config
+        self.eos_token_id = 0
+
+        self.use_gpu = False
+
+        # coming soon
+        self.windows_local_foundry_active = False
+
+        # no api key expected or required
+        self.api_key = api_key
+
+        self.error_message = "\nUnable to identify and load HuggingFace model."
+
+        # temperature settings
+
+        # if temperature set at time of loading the model, then use that setting
+        if temperature != -99:
+            self.temperature = temperature
+        elif "temperature" in model_card:
+            # if not set, then pull the default temperature from the model card
+            self.temperature = model_card["temperature"]
+        else:
+            # if no guidance from model loading or model card, then set at default of 0.3
+            self.temperature = 0.3
+
+        self.add_prompt_engineering = False
+        self.add_context = ""
+        self.context = ""
+        self.prompt = ""
+
+        # not currently implemented for this model class
+        self.api_endpoint = api_endpoint
+
+        self.model_repo_path = None
+
+        # confirm platform check
+        import sys
+        import platform
+        plat = sys.platform
+        mach = platform.machine().lower()
+        logger.info(f"ONNXQNNGenerativeModel - platform - {plat} - machine - {mach}")
+
+        if not (plat == "win32" and mach == "arm64"):
+            logger.warning(f"ONNXQNNGenerativeModel is designed for Windows Arm64.")
+
+        self.post_init()
+
+    def load_model_for_inference(self, loading_directions, model_card=None):
+
+        """ Loads ONNX Model from local path using loading directions. """
+
+        self.model_repo_path = loading_directions
+
+        if model_card:
+            self.model_card = model_card
+
+        self.validate()
+
+        onnx_model_path = os.path.join(LLMWareConfig().get_model_repo_path(),
+                                       self.model_name)
+
+        if self.npu_optimized:
+            # get npu optimized onnxruntime with qnn
+            set_for_npu_qnn = True
+
+        # starting with onnxruntime-qnn 2.0, need to set qnn execution provider path
+        # e.g., path to "onnxruntime_providers_qnn.dll"
+
+        qnn_path = os.environ.get("qnn_onnx_path","")
+        if not qnn_path:
+            # by default, look in the onnxruntime_qnn package
+            import onnxruntime_qnn
+            backend_path = os.path.dirname(onnxruntime_qnn.__file__)
+            qnn_path = os.path.join(backend_path, "onnxruntime_providers_qnn.dll")
+
+        # register the backend
+        og.register_execution_provider_library("QNNExecutionProvider", qnn_path)
+
+        logger.info(f"ONNXQNNGenerativeModel - load_model_for_inference - qnn path - {qnn_path}")
+
+        # use global onnxruntime_genai - constructing model from config
+        config = og.Config(onnx_model_path)
+        self.model = og.Model(config)
+
+        self.tokenizer = og.Tokenizer(self.model)
+        self.tokenizer_stream = self.tokenizer.create_stream()
+
+        search_options = {}
+        search_options['max_length'] = 2048
+        search_options['batch_size'] = 1
+        self.params = og.GeneratorParams(self.model)
+        self.params.set_search_options(**search_options)
+
+        logger.info(f"ONNXQNNGenerativeModel - constructed model - {self.model_name}.")
+
+        return self
+
+    def unload_model(self):
+        """ Not implemented. """
+        return True
+
+    def set_api_key(self, api_key, env_var=""):
+        """ Not implemented for ONNXQNNGenerativeModel """
+        return True
+
+    def _get_api_key(self, env_var=""):
+        """ Not implemented for ONNXQNNGenerativeModel """
+        return True
+
+    def inference(self, prompt, add_context=None, add_prompt_engineering=None, api_key=None,
+                  inference_dict=None):
+
+        """ Executes generation inference on model. """
+
+        # first prepare the prompt
+        t0 = time.time()
+
+        self.prompt = prompt
+
+        if add_context:
+            self.add_context = add_context
+
+        if add_prompt_engineering:
+            self.add_prompt_engineering = add_prompt_engineering
+
+        #   add defaults if add_prompt_engineering not set
+        if not self.add_prompt_engineering:
+
+            if self.add_context:
+                self.add_prompt_engineering = "default_with_context"
+            else:
+                self.add_prompt_engineering = "default_no_context"
+
+        #   end - defaults update
+
+        if inference_dict:
+
+            if "temperature" in inference_dict:
+                self.temperature = inference_dict["temperature"]
+
+            if "max_tokens" in inference_dict:
+                self.target_requested_output_tokens = inference_dict["max_tokens"]
+
+        self.preview()
+
+        text_prompt = self.prompt
+
+        if self.add_prompt_engineering:
+            prompt_enriched = self.prompt_engineer(self.prompt, self.add_context, inference_dict=inference_dict)
+            prompt_final = prompt_enriched
+            text_prompt = prompt_final + self.trailing_space
+
+        input_tokens = self.tokenizer.encode(text_prompt)
+
+        token_count = 0
+        output = ""
+
+        generator = og.Generator(self.model, self.params)
+
+        # note: onnxruntime_genai library makes a lot of small breaking changes
+        # in their generation loops -> this should be OK with versions >0.9.0
+        # if you see error, then check the documentation for onnxruntime_genai
+        # which is pretty good at explaining/documenting the change and how to fix
+
+        generator.append_tokens(input_tokens)
+
+        try:
+
+            while not generator.is_done():
+
+                token_count += 1
+
+                # change in v0.6 api - explicit compute logits call not required
+                # generator.compute_logits()
+
+                generator.generate_next_token()
+
+                # not activated currently
+                self.get_logits = False
+                # to get logit value
+                if self.get_logits:
+                    logit = generator.get_output("logits")
+                    self.register_top_logits(logit)
+
+                new_token = generator.get_next_tokens()[0]
+
+                if self.get_logits:
+                    self.output_tokens.append(new_token)
+
+                output += self.tokenizer_stream.decode(new_token)
+
+                if token_count > self.max_output:
+                    break
+
+        except Exception as e:
+            logger.warning(f"ONNXQNNGenerativeModel inference produced error - {e}")
+            pass
+
+        del generator
+
+        usage = {"input": len(input_tokens),
+                 "output": token_count,
+                 "total": len(input_tokens) + token_count,
+                 "metric": "tokens",
+                 "processing_time": time.time() - t0}
+
+        output_response = {"llm_response": output, "usage": usage}
+
+        if self.get_logits:
+            output_response.update({"logits": self.logits_record})
+            output_response.update({"output_tokens": self.output_tokens})
+            self.logits = self.logits_record
+
+        # output inference parameters
+        self.llm_response = output
+        self.usage = usage
+        self.final_prompt = text_prompt
+
+        self.register()
+
+        return output_response
+
+    def stream(self, prompt, add_context=None, add_prompt_engineering=None, api_key=None,
+               inference_dict=None, skip_pe_override=False):
+
+        """ Executes stream generation inference on model. """
+
+        # first prepare the prompt
+        t0 = time.time()
+
+        self.prompt = prompt
+
+        if add_context:
+            self.add_context = add_context
+
+        if add_prompt_engineering:
+            self.add_prompt_engineering = add_prompt_engineering
+
+        #   add defaults if add_prompt_engineering not set
+        if not self.add_prompt_engineering:
+
+            if self.add_context:
+                self.add_prompt_engineering = "default_with_context"
+            else:
+                self.add_prompt_engineering = "default_no_context"
+
+        #   end - defaults update
+
+        if inference_dict:
+
+            if "temperature" in inference_dict:
+                self.temperature = inference_dict["temperature"]
+
+            if "max_tokens" in inference_dict:
+                self.target_requested_output_tokens = inference_dict["max_tokens"]
+
+        self.preview()
+
+        text_prompt = self.prompt
+
+        if self.add_prompt_engineering and not skip_pe_override:
+            prompt_enriched = self.prompt_engineer(self.prompt, self.add_context, inference_dict=inference_dict)
+            prompt_final = prompt_enriched
+            text_prompt = prompt_final + self.trailing_space
+
+        logger.debug("ONNXQNNGenerative Model - onnx stream starting.")
+
+        input_tokens = self.tokenizer.encode(text_prompt)
+
+        token_count = 0
+        output = ""
+
+        # note: onnxruntime_genai library makes a lot of small breaking changes
+        # in their generation loops -> this should be OK with versions > 0.9.0
+        # if you see error, then check the documentation for onnxruntime_genai
+        # which is pretty good at explaining/documenting the change and how to fix
+
+        self.generator = og.Generator(self.model, self.params)
+
+        self.generator.append_tokens(input_tokens)
+
+        while True:
+
+            token_count += 1
+
+            # change in v0.6 api - no explicit compute logits call
+            # self.generator.compute_logits()
+
+            self.generator.generate_next_token()
+
+            if self.generator.is_done():
+                break
+
+            self.get_logits = False
+            # to get logit value
+            if self.get_logits:
+                logit = self.generator.get_output("logits")
+                self.register_top_logits(logit)
+
+            new_token = self.generator.get_next_tokens()[0]
+
+            if self.get_logits:
+                self.output_tokens.append(new_token)
+
+            output += self.tokenizer_stream.decode(new_token)
+
+            if token_count > self.max_output:
+                break
+
+            yield self.tokenizer_stream.decode(new_token)
+
+        self.generator = None
+
+        usage = {"input": len(input_tokens),
+                 "output": token_count,
+                 "total": len(input_tokens) + token_count,
+                 "metric": "tokens",
+                 "processing_time": time.time() - t0}
+
+        output_response = {"llm_response": output, "usage": usage}
+
+        if self.get_logits:
+            output_response.update({"logits": self.logits_record})
+            output_response.update({"output_tokens": self.output_tokens})
+            self.logits = self.logits_record
+
+        # output inference parameters
+        self.llm_response = output
+        self.usage = usage
+        self.final_prompt = text_prompt
+
+        self.register()
+
+        logger.debug("ONNXQNNGenerativeModel - completed stream generation.")
+
+        return output_response
+
+    def cleanup_stream_gen_on_early_stop(self):
+
+        self.generator = None
+        return True
+
+    def register_top_logits(self, logit):
+
+        """ Gets the top logits and keeps a running log for output analysis. """
+
+        # logit will be in form of (1,1,vocab_len), for all but the first logit
+        # if first logit (will have shape of context len - add [-1])
+
+        if logit.shape[1] > 1:
+            # used for first logit with shape, e.g., (1,input_token_len,vocab_size)
+            logit_array = logit.squeeze()[-1]
+        else:
+            # all other logits after the first token
+            logit_array = logit.squeeze()
+
+        logit_size = logit.shape[-1]
+
+        # useful check on shape of logit_array
+        logit_array_size = logit_array.shape
+
+        sm = np.exp(logit_array) / sum(np.exp(logit_array))
+
+        sm_sorted = np.sort(sm)
+        sm_args_sorted = np.argsort(sm)
+
+        top_logits = []
+
+        for x in range(0, self.top_logit_count):
+            # round the float number to 3 digits
+            pair = (sm_args_sorted[logit_size - x - 1], round(sm_sorted[logit_size - x - 1], 3))
+            top_logits.append(pair)
+
+        self.logits_record.append(top_logits)
+
+        return top_logits
 
 
 class LLMWareModel(BaseModel):
@@ -6684,257 +8363,6 @@ class OpenAIEmbeddingModel(BaseModel):
         self.register()
 
         return embedding
-
-
-class CohereEmbeddingModel(BaseModel):
-
-    """ CohereEmbeddingModel implements the Cohere API for embedding models. """
-
-    def __init__(self, model_name = None, api_key=None, embedding_dims=None, model_card=None,max_len=None, **kwargs):
-
-        super().__init__(**kwargs)
-
-        self.model_class = "CohereEmbeddingModel"
-        self.model_category = "embedding"
-
-        self.api_key = api_key
-        self.model_name = model_name
-        self.model_card = model_card
-
-        if not embedding_dims:
-            self.embedding_dims = 4096
-        else:
-            self.embedding_dims = embedding_dims
-
-        self.max_total_len = 2048
-        self.error_message = "\nUnable to connect to Cohere. Please try again later."
-
-        self.max_len = self.max_total_len
-        if max_len:
-            if max_len < self.max_total_len:
-                self.max_len = max_len
-
-        self.text_sample = None
-
-        self.post_init()
-
-    def set_api_key(self, api_key, env_var="USER_MANAGED_COHERE_API_KEY"):
-
-        """ Utility method to set the API key in os.environ variable. """
-
-        os.environ[env_var] = api_key
-        logger.info("update: added and stored COHERE api_key in environmental variable- %s", env_var)
-
-        return self
-
-    def _get_api_key(self, env_var="USER_MANAGED_COHERE_API_KEY"):
-
-        """ Utility method to get api_key from os.environ variable. """
-
-        self.api_key = os.environ.get(env_var)
-
-        return self.api_key
-
-    def token_counter(self, text_sample):
-
-        """ Gets GPT2 tokenizer for fast approximate token counting. """
-
-        tokenizer = Utilities().get_default_tokenizer()
-        toks = tokenizer.encode(text_sample).ids
-        return len(toks)
-
-    def embedding(self,text_sample):
-
-        self.text_sample = text_sample
-
-        #   call to preview (not implemented by default)
-        self.preview()
-
-        if not self.api_key:
-            self.api_key = self._get_api_key()
-
-        if not self.api_key:
-            logger.error("error: invoking Cohere embedding model with no api_key")
-
-        try:
-            import cohere
-        except ImportError:
-            raise DependencyNotInstalledException("cohere")
-
-        co = cohere.Client(self.api_key)
-
-        # need safety check on length of text_sample
-
-        # need to prepare for batches
-        if isinstance(self.text_sample, list):
-            text_prompt = self.text_sample
-            input_len = len(self.text_sample)
-        else:
-            text_prompt = [self.text_sample]
-            input_len = 1
-
-        # adding model name as parameter passed to the Cohere embedding API
-        response = co.embed(text_prompt,model=self.model_name)
-
-        output = []
-        for i, emb in enumerate(response.embeddings):
-
-            logger.debug(f"Cohere embedding - {i} - {emb}")
-
-            # normalization of the Cohere embedding vector improves performance
-            emb_vec = np.array(emb) / np.linalg.norm(emb)
-
-            output.append(emb_vec)
-
-        self.register()
-
-        return output
-
-
-class GoogleEmbeddingModel(BaseModel):
-
-    """ GoogleEmbeddingModel implements the Google API for text embedding models.  Note: to use Google models
-    requires a separate install of the Google SDKs, e.g., vertexai and google.cloud.platform """
-
-    def __init__(self, model_name=None, api_key=None, embedding_dims=None, model_card=None, max_len=None, **kwargs):
-
-        super().__init__(**kwargs)
-
-        self.model_class = "GoogleEmbeddingModel"
-        self.model_category = "embedding"
-
-        self.api_key = api_key
-        self.model_name = model_name
-        self.model_card = model_card
-
-        self.max_total_len = 3072
-
-        # supports context window up to 3072 tokens for embedding
-
-        if not embedding_dims:
-            self.embedding_dims = 768   # Google text-embedding-gecko-001 has 768 dims
-        else:
-            self.embedding_dims = embedding_dims
-
-        self.error_message = "\nUnable to connect to Google/Text Embedding Model. Please try again later."
-
-        self.max_len = self.max_total_len
-        if max_len:
-            if max_len < self.max_total_len:
-                self.max_len = max_len
-
-        self.text_sample = None
-
-        self.post_init()
-
-    def set_api_key(self, api_key, env_var="USER_MANAGED_GOOGLE_API_KEY"):
-
-        """ Utility method to set the API key in os.environ variable. """
-
-        os.environ[env_var] = api_key
-        logger.info("update: added and stored GOOGLE api_key in environmental variable- %s", env_var)
-
-        return self
-
-    def _get_api_key(self, env_var="USER_MANAGED_GOOGLE_API_KEY"):
-
-        """ Utility method to get api_key from os.environ variable. """
-
-        self.api_key = os.environ.get(env_var)
-        return self.api_key
-
-    def token_counter(self, text_sample):
-
-        """ Gets GPT2 tokenizer for fast approximate token counting. """
-
-        tokenizer = Utilities().get_default_tokenizer()
-        toks = tokenizer.encode(text_sample).ids
-        return len(toks)
-
-    def embedding(self,text_sample, api_key= None):
-
-        """ Executes Embedding inference on Model. """
-
-        self.text_sample = text_sample
-
-        #   call to preview (not implemented by default)
-        self.preview()
-
-        if api_key:
-            self.api_key = api_key
-
-        if not self.api_key:
-            self.api_key = self._get_api_key()
-
-        if not self.api_key:
-            logger.error("error: invoking Google Embedding model with no api_key")
-
-        # Important: Before calling the model, we need to ensure the contents of the api_key
-        # (the json dict string) have been persisted to a file
-        # and the environment variable GOOGLE_APPLICATION_CREDENTIALS points to that file path
-
-        google_json_credentials = self.api_key_to_json()
-        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = google_json_credentials
-
-        embeddings_output = []
-
-        try:
-            from vertexai.preview.language_models import TextGenerationModel, TextEmbeddingModel
-            from vertexai import init
-            import google.cloud.aiplatform as aiplatform
-        except ImportError:
-            raise DependencyNotInstalledException("google-cloud-aiplatform")
-
-        try:
-
-            model = TextEmbeddingModel.from_pretrained("textembedding-gecko@001")
-
-            if isinstance(self.text_sample,list):
-                text_list = self.text_sample
-            else:
-                text_list = [self.text_sample]
-
-            # need to batch the text list
-            # Google appears to set a cap of 5 text samples per embedding inference call
-
-            google_max_samples_per_inference = 5
-
-            batch_count = len(text_list) // google_max_samples_per_inference
-            if batch_count * google_max_samples_per_inference < len(text_list):
-                batch_count += 1
-
-            for x in range(0, batch_count):
-                new_batch = text_list[x*google_max_samples_per_inference:
-                                      min((x+1)*google_max_samples_per_inference, len(text_list))]
-
-                logger.debug("update: new batch - %s - %s ", x, len(new_batch))
-
-                embeddings_from_google = model.get_embeddings(new_batch)
-
-                for i, embedding in enumerate(embeddings_from_google):
-                    embeddings_output.append(np.array(embedding.values))
-
-        except Exception as e:
-            # raise LLMInferenceResponseException(e)
-            logger.error("error: Google model inference produced error - %s ", e)
-
-        finally:
-            os.remove(google_json_credentials)
-
-        self.register()
-
-        return embeddings_output
-
-    def api_key_to_json(self):
-
-        # Google authentication key is an entire json dictionary which we have the user pass in as an env var
-        # We write out the json and we need to escape newlines which seem to be always present in
-        # google auth json files
-
-        temp_json_path = tempfile.NamedTemporaryFile(prefix="googlecreds", delete=False).name
-        with open(temp_json_path, "w", encoding='utf-8') as f:
-            f.write(self.api_key.replace("\n", "\\n"))
-        return temp_json_path
 
 
 class HFReRankerModel(BaseModel):
@@ -7657,8 +9085,8 @@ class HFGenerativeModel(BaseModel):
 
         #   show warning if function calling model
         if self.fc_supported:
-            logger.warning("warning: this is a function calling model - using .inference may lead to unexpected "
-                            "results.   Recommended to use the .function_call method to ensure correct prompt "
+            logger.warning("This is a function calling model - using .inference may lead to unexpected "
+                            "results. Recommended to use the .function_call method to ensure correct prompt "
                             "template packaging.")
 
         if inference_dict:
@@ -8419,23 +9847,13 @@ class GGUFGenerativeModel(BaseModel):
     """ Implementation of GGUF Model class - instantiate and run inferences and function calls using
     GGUF llama.cpp models """
 
-    #   This implementation of GGUFGenerativeModel provides a fairly complete python API interface into
-    #   llama.cpp.  llama.cpp is a pure C/C++ implementation of tensor-level model operations, including
-    #   quantization and various sampling techniques to enable LLMs to run locally on a CPU (and without Pytorch).
-    #   For more information on llama.cpp:  please see https://github.com/ggerganov/llama.cpp
-
-    #   As of llmware 0.2.4 (~end Feb 2024), we have updated the interface to align with
-    #   llama_cpp_python (please see https://github.com/abetlen/llama-cpp-python)
-    #   to expose more llama.cpp interfaces and to build shared libraries directly
-    #   from llama_cpp, using a build script that is intended to be compatible with llama_cpp_python
-    #   with the primary objective of aligning to emerging standards and norms, and to enable advanced users
-    #   to "bring their own" pre-built llama_cpp libs in conjunction with llmware
-
     def __init__(self, model_name=None, model_card=None, api_key=None, prompt_wrapper=None, instruction_following=False,
                  context_window=2048, use_gpu_if_available=True, get_logits=False,
-                 sample=True,max_output=100, temperature=0.3, api_endpoint=None, **kwargs):
+                 sample=True, max_output=100, temperature=0.3, api_endpoint=None, **kwargs):
 
         super().__init__(**kwargs)
+
+        logger.debug("GGUFGenerativeModel - constructing GGUF model.")
 
         self.model_class = "GGUFGenerativeModel"
         self.model_category = "generative"
@@ -8448,41 +9866,36 @@ class GGUFGenerativeModel(BaseModel):
 
         #   set verbose level in environ level - will be picked up by callback in llama_cpp
         os.environ["llama_cpp_verbose"] = GGUFConfigs().get_config("llama_cpp_verbose")
-
+        # os.environ["llama_cpp_verbose"] = "ON"
         #   adding new parameters - use_sampling, temperature, max_output
-        self.use_sampling=sample
-        self.get_logits=get_logits
+
+        self.use_sampling = sample
+        self.sample = sample
+
+        self.get_logits = get_logits
         self.logits_record = []
         self.output_tokens = []
         self.top_logit_count = 10
         self.auto_remediate_function_call_output = True
-
-        # TODO:  max_output by GGUFConfigs defaults
 
         #   default safety check in GGUF Configs that can be adjusted
         gguf_configs_max = GGUFConfigs().get_config("max_output_tokens")
 
         if max_output > gguf_configs_max:
             # truncate max output to GGUFConfigs max
-            logger.warning(f"update: requested output len - {max_output} > {gguf_configs_max}, which is the "
-                            f"current GGUF default max.\n--Truncating to {gguf_configs_max} output tokens.\n--Note: "
-                            f"to change GGUF default max to new integer amount, say 500:\n "
-                            f"  GGUFConfigs().set_config(\"max_output_tokens\", 500)"
-                            )
+            # logger.warning(f"update: requested output len - {max_output} > {gguf_configs_max}, which is the "
+            #                f"current GGUF default max.\n--Truncating to {gguf_configs_max} output tokens.\n--Note: "
+            #                f"to change GGUF default max to new integer amount, say 500:\n "
+            #                f"  GGUFConfigs().set_config(\"max_output_tokens\", 500)"
+            #                )
 
             max_output = gguf_configs_max
 
-        self.max_output=max_output
-
-        #   key configs
-        # self.n_seq_max = GGUFConfigs().get_config("max_output_tokens")
-        #   *** NEW - KEY CHANGE ***
+        self.max_output = max_output
         self.n_seq_max = max_output
-        #   *** end key change ***
 
         self.target_requested_output_tokens = self.n_seq_max
 
-        # TODO: cleanup repetitive output size attributes
         self.max_total_len = 2048
         self.max_input_len = int(0.5 * context_window)
         self.llm_max_output_len = int(0.5 * context_window)
@@ -8576,7 +9989,7 @@ class GGUFGenerativeModel(BaseModel):
                 self.use_gpu = False
             else:
                 # min drivers set to the lowest level for CUDA 12.1 on Linux
-                min_drivers = [525,60]
+                min_drivers = [525, 60]
                 if sys.platform.lower() == "win32":
                     min_drivers = GGUFConfigs().get_config("cuda_windows_driver_min")
 
@@ -8590,14 +10003,18 @@ class GGUFGenerativeModel(BaseModel):
                 #   ModelCatalog.gpu_available method
 
                 self.use_gpu = (GGUFConfigs().get_config("use_gpu")
-                            and sys.platform.lower() in GGUFConfigs().get_config("cuda_platforms")
-                            and gpu_available["drivers_current"] and gpu_available["gpu_found"]
-                            and use_gpu_if_available)
+                                and sys.platform.lower() in GGUFConfigs().get_config("cuda_platforms")
+                                and gpu_available["drivers_current"] and gpu_available["gpu_found"]
+                                and use_gpu_if_available)
 
         # set default minimum
         self.n_batch = 2048
+        # self.n_batch = 512
 
         self.last_n_tokens_size = 64
+
+        # by default
+        self._logits_all = False
 
         self._n_vocab = None
         self._n_ctx = None
@@ -8625,9 +10042,15 @@ class GGUFGenerativeModel(BaseModel):
 
         self.model_repo_path = None
 
+        self._sampler = None
+        self.vocab = None
+
+        self.input_token_count = 0
+        self.output_token_count = 0
+
         self.post_init()
 
-    def load_model_for_inference(self, model_repo_path, model_card = None, **kwargs):
+    def load_model_for_inference(self, model_repo_path, model_card=None, **kwargs):
 
         """ Loads and instantiates model along with other required objects. """
 
@@ -8641,6 +10064,7 @@ class GGUFGenerativeModel(BaseModel):
 
         # load shared library
         self._lib = self._load_llama_cpp_shared_library()
+
         self._lib = add_ctypes_declarations(self._lib)
 
         if not GGUFConfigs().get_config("backend_initialized"):
@@ -8653,8 +10077,12 @@ class GGUFGenerativeModel(BaseModel):
         self.model_params = self._lib.llama_model_default_params()
 
         # update model params parameters
-        self.model_params.n_gpu_layers = 0
-        self.model_params.split_mode = 1
+        # important to set this correctly for Mac performance
+        self.model_params.n_gpu_layers = 50
+
+        # deprecated - change default split_mode from 1 -> 0
+        # self.model_params.split_mode = 0
+
         self.model_params.main_gpu = 0
         self.model_params.vocab_only = False
         self.model_params.use_mmap = True
@@ -8663,7 +10091,6 @@ class GGUFGenerativeModel(BaseModel):
         if self.use_gpu:
             # on darwin, keep at 0 - on win32 and linux - set to 50 by default (e.g., shift all model layers to GPU)
             if sys.platform.lower() == "win32" or sys.platform.lower().startswith("linux"):
-
                 self.model_params.n_gpu_layers = GGUFConfigs().get_config("n_gpu_layers")
 
         # update context parameters
@@ -8671,8 +10098,48 @@ class GGUFGenerativeModel(BaseModel):
 
         #   sets minimum of 2048, but will extend if context_window is larger (e.g., 4096/8192+)
         self.context_params.n_ctx = max(2048, self.max_total_len)
-
         self.context_params.n_batch = self.n_batch
+
+        n_ubatch = 512
+        self.context_params.n_ubatch = min(self.n_batch, n_ubatch)
+
+        # check on QC/ARM if 6 & 12 are ideal
+        # big improvement on MAC with formula below
+        # QC/ARM = 6
+        import multiprocessing
+
+        self.context_params.n_threads = max(multiprocessing.cpu_count() // 2, 1)
+        # QC/ARM = 12
+        self.context_params.n_threads_batch = multiprocessing.cpu_count()
+
+        self.context_params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED
+        self.context_params.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED
+        self.context_params.rope_freq_base = 0.0  # (rope_freq_base if rope_freq_base != 0.0 else 0)
+        self.context_params.rope_freq_scale = 0.0
+
+        # changed: defaults changed in llama cpp from build b6323 -> b6325
+        # self.context_params.yarn_ext_factor = -1.0
+        # self.context_params.yarn_attn_factor = 1.0
+        # self.context_params.yarn_beta_fast = 32.0
+        # self.context_params.yarn_beta_slow = 1.0
+        # end changes
+
+        self.context_params.type_k = 1
+        self.context_params.type_v = 1
+        self.context_params.offload_kqv = True
+        self.context_params.yarn_orig_ctx = 0
+        self.context_params.no_perf = False
+
+        # changes - llama cpp change from b6323 -> b6325
+        self.context_params.flash_attn = 0 # False
+        # self.context_params.flash_attn_type = 0
+        # end changes
+
+        self.context_params.embedding = False
+        self.context_params.swa_full = None
+        self.context_params.op_offloat = None
+
+        self.context_params.kv_unified = False
 
         if model_card:
             self.model_name = model_card["model_name"].split("/")[-1]
@@ -8683,8 +10150,12 @@ class GGUFGenerativeModel(BaseModel):
 
         #   loads and instantiates the key objects
         self._model = _LlamaModel(self._lib, path_model=self.model_path, params=self.model_params)
-        self._ctx = _LlamaContext(self._lib,model=self._model, params=self.context_params)
-        self._batch = _LlamaBatch(self._lib,n_tokens=self.n_batch, embd=0, n_seq_max=self.context_params.n_ctx)
+
+        self._ctx = _LlamaContext(self._lib, model=self._model, params=self.context_params)
+
+        self._batch = _LlamaBatch(self._lib, n_tokens=self.n_batch, embd=0, n_seq_max=self.context_params.n_ctx)
+
+        self.vocab = self._lib.llama_model_get_vocab(self._model.model)
 
         self._n_vocab = self.n_vocab()
         self._n_ctx = self.n_ctx()
@@ -8696,6 +10167,10 @@ class GGUFGenerativeModel(BaseModel):
 
         self.input_ids = np.ndarray((self._n_ctx,), dtype=np.intc)
         self.scores = np.ndarray((self._n_ctx, self._n_vocab), dtype=np.single)
+
+        self._sampler = self._init_sampler()
+
+        logger.info("GGUFGenerativeModel - loaded model - ready for inference")
 
         return self
 
@@ -8716,11 +10191,9 @@ class GGUFGenerativeModel(BaseModel):
             if os.path.exists(custom_path):
                 _lib_paths = [custom_path]
             else:
-                raise "ModuleNotFound error: could not find location of custom lib"
+                raise LLMWareException(message="ModuleNotFound error: could not find location of custom lib")
 
         else:
-
-            # general case - will look for llama.cpp dynamic library included with llmware
 
             _base_path = os.path.join(LLMWareConfig.get_config("shared_lib_path"), "gguf")
 
@@ -8731,65 +10204,55 @@ class GGUFGenerativeModel(BaseModel):
             # Determine the file extension based on the platform
             if system_platform.startswith("linux"):
 
-                if self.use_gpu:
-                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_cuda")))
+                # three linux versions supported - linux_x86 and linux_cuda
+                machine = os.uname().machine.lower()
 
-                    # new - will try to use x86 as fallback
-                    fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("linux_x86"))
+                if machine == "aarch64" and self.use_gpu:
+                    _lib_paths.append(os.path.join(_base_path,
+                                                   GGUFConfigs().get_config("linux_aarch64_cuda_lib"),
+                                                   GGUFConfigs().get_config("linux_cuda")))
+
+                elif self.use_gpu:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_cuda_lib"),
+                                                   GGUFConfigs().get_config("linux_cuda")))
+
+                    # will try to use x86 as fallback
+                    fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("linux_x86_lib"),
+                                                    GGUFConfigs().get_config("linux_x86"))
 
                 else:
-                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_x86")))
+                    # by default load the cpu x86 lib
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_x86_lib"),
+                                                   GGUFConfigs().get_config("linux_x86")))
 
             elif system_platform == "darwin":
 
-                machine = os.uname().machine.lower()
-
-                if machine == 'x86_64':
-                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("mac_x86")))
-                else:
-
-                    if GGUFConfigs().get_config("use_macos_accelerate"):
-
-                        try:
-                            import platform
-                            macos_ver = platform.mac_ver()
-                            if len(macos_ver) > 0:
-                                ver = macos_ver[0].split(".")
-
-                                v1 = int(ver[0])
-                                v2 = int(ver[1])
-
-                                if v1 < 14:
-
-                                    logger.warning(f"warning: detected older version of macos - {macos_ver} - "
-                                                    f"which may produce errors related to the Accelerate framework.\n"
-                                                    f"To remove this warning: (1) upgrade to Sonoma (>14.0) or \n(2) set "
-                                                    f"GGUF configs to use non Accelerate binary by default:\n"
-                                                    f"GGUFConfigs().set_config('use_macos_accelerate', False)")
-
-                        except:
-                            pass
-
-                        _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("mac_metal")))
-
-                        fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("mac_metal_no_acc"))
-
-                    else:
-                        _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("mac_metal_no_acc")))
+                _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("mac_metal_lib"),
+                                               GGUFConfigs().get_config("mac_metal")))
 
             elif sys.platform == "win32":
 
-                if self.use_gpu:
-                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_cuda")))
+                import platform
+                if platform.machine().lower() == "arm64":
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_arm64_lib"),
+                                                   GGUFConfigs().get_config("windows_arm64")))
+
+                # windows cuda
+                elif self.use_gpu:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_cuda_lib"),
+                                                   GGUFConfigs().get_config("windows_cuda")))
 
                     # new - will try to use x86 as fallback
-                    fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("windows"))
+                    fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("windows_x86_lib"),
+                                                    GGUFConfigs().get_config("windows"))
 
                 else:
-                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows")))
+                    # main case - windows x86
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_x86_lib"),
+                                                   GGUFConfigs().get_config("windows")))
 
             else:
-                raise ModuleNotFoundException(f"No Matching Llama.CPP binary for platform - {system_platform}")
+                raise LLMWareException(message=f"No matching llama.cpp binary for platform - {system_platform}")
 
             # Add the library directory to the DLL search path on Windows (if needed)
             if sys.platform == "win32" and sys.version_info >= (3, 8):
@@ -8800,18 +10263,12 @@ class GGUFGenerativeModel(BaseModel):
                     os.add_dll_directory(os.path.join(os.environ["CUDA_PATH"], "bin"))
                     os.add_dll_directory(os.path.join(os.environ["CUDA_PATH"], "lib"))
 
-                # not supported currently
-                """
-                if "HIP_PATH" in os.environ:
-                    os.add_dll_directory(os.path.join(os.environ["HIP_PATH"], "bin"))
-                    os.add_dll_directory(os.path.join(os.environ["HIP_PATH"], "lib"))
-                """
-                # end - review options
-
                 cdll_args["winmode"] = ctypes.RTLD_GLOBAL
 
         # Try to load the shared library, handling potential errors
         for _lib_path in _lib_paths:
+
+            logger.debug(f"Loading llama cpp backend - {_lib_path}")
 
             if not os.path.exists(_lib_path):
                 if fall_back_option:
@@ -8820,18 +10277,17 @@ class GGUFGenerativeModel(BaseModel):
             if os.path.exists(_lib_path):
 
                 try:
-                    return ctypes.CDLL(str(_lib_path), **cdll_args)
+                    return ctypes.cdll.LoadLibrary(str(_lib_path))
 
                 except Exception as e:
 
-                    # NEW INSERT - if fail, and CUDA selected, then try to fall back to matching CPU version
+                    #  if fail, and CUDA selected, then try to fall back to matching CPU version
                     if fall_back_option:
                         try:
 
-                            logger.warning("update: Not successful loading GPU-accelerated lib, "
-                                           "so reverting to CPU driver.")
+                            logger.warning("Not successful loading preferred lib so reverting to fallback lib.")
 
-                            return ctypes.CDLL(str(fall_back_option), **cdll_args)
+                            return ctypes.cdll.LoadLibrary(str(_lib_path))
                         except:
 
                             # if fall-back fails
@@ -8841,13 +10297,60 @@ class GGUFGenerativeModel(BaseModel):
                                                             _lib_path,
                                                             custom_path)
                     else:
-                        raise GGUFLibNotLoadedException("llama_cpp_backend",sys.platform.lower(),
+                        raise GGUFLibNotLoadedException("llama_cpp_backend" ,sys.platform.lower(),
                                                         self.use_gpu, _lib_path, custom_path)
 
         # if not loaded
-        raise ModuleNotFoundException("llama_cpp_backend")
+        raise LLMWareException(message=f"GGUFGenerativeModel - attempting to load llama cpp backend lib - "
+                                       f"Llama cpp backend not found.")
 
-    def _inference (self, prompt):
+    def _init_sampler(self):
+
+        # create sampler
+        # default params are struct
+        params = llama_sampler_chain_params()
+        self._sampler = self._lib.llama_sampler_chain_init(params)
+
+        temp = 0.0
+
+        if temp < 0.0:
+            # sampler.add_softmax()
+            self._lib.llama_sampler_chain_add(self._sampler, self._lib.llama_sampler_init_softmax())
+            # sampler.add_dist(self._seed)
+
+        elif temp == 0.0:
+            # sampler.add_greedy()
+            greedy_sampler = self._lib.llama_sampler_init_greedy()
+
+            self._lib.llama_sampler_chain_add(self._sampler, greedy_sampler)
+
+        return self._sampler
+
+    def sample_gguf(self, idx=None):
+
+        """ Adapted to sample_gguf to avoid potential name space conflicts. """
+
+        # assert self.n_tokens > 0
+
+        tmp_sampler = False
+
+        if self._sampler is None:
+            tmp_sampler = True
+            self._sampler = self._init_sampler()
+
+        ridx = idx - self.n_tokens if idx is not None else -1
+
+        assert self.ctx is not None
+
+        token = self._lib.llama_sampler_sample(self._sampler, self._ctx.ctx, ridx)
+
+        # token = int(self.logits_record[-1][0][0])
+
+        if tmp_sampler:
+            self._sampler = None
+        return token
+
+    def _inference(self, prompt):
 
         """ Tokenizes the prompt and executes generation loop. """
 
@@ -8870,9 +10373,9 @@ class GGUFGenerativeModel(BaseModel):
         context_window = self.n_ctx()
 
         if input_len > context_window:
-            logger.warning("update: GGUFGenerativeModel - input is too long for model context window - truncating")
+            logger.info("GGUFGenerativeModel - input is too long for model context window - truncating")
             min_output_len = 10
-            prompt_tokens = prompt_tokens[0:context_window-min_output_len]
+            prompt_tokens = prompt_tokens[0:context_window - min_output_len]
             input_len = len(prompt_tokens)
 
         text = b""
@@ -8940,18 +10443,19 @@ class GGUFGenerativeModel(BaseModel):
         if get_first_token_speed:
 
             output = {"llm_response": text_str,
-                      "usage": {"input": len(prompt_tokens),"output": len(completion_tokens),
+                      "usage": {"input": len(prompt_tokens), "output": len(completion_tokens),
                                 "total": len(prompt_tokens) + len(completion_tokens), "metric": "tokens",
                                 "processing_time": time.time() - t0,
                                 "first_token_processing_time": first_token_processing_time}}
         else:
             output = {"llm_response": text_str,
-                      "usage": {"input": len(prompt_tokens),"output": len(completion_tokens),
+                      "usage": {"input": len(prompt_tokens), "output": len(completion_tokens),
                                 "total": len(prompt_tokens) + len(completion_tokens), "metric": "tokens",
                                 "processing_time": time.time() - t0}}
 
         if self.get_logits:
-            output.update({"logits": self.logits_record, "output_tokens": self.output_tokens})
+            output.update({"logits": self.logits_record})
+            output.update({"output_tokens": self.output_tokens})
 
         return output
 
@@ -8959,55 +10463,66 @@ class GGUFGenerativeModel(BaseModel):
 
         """ Generator that samples the model and yields tokens until stopped. """
 
+        logger.debug("GGUFGenerativeModel - starting generation loop")
+
         # Reset the model state
         if reset:
             self.reset()
 
-        sample_idx = self.n_tokens + len(tokens) -1
+        sample_idx = self.n_tokens + len(tokens) - 1
         tokens = list(tokens)
 
         tokens_created = 0
         input_start_len = len(tokens)
 
+        memory = self._ctx.memory
+
         # Eval and sample
         while True:
 
-            self._lib.llama_kv_cache_seq_rm(self._ctx.ctx, -1, self.n_tokens, -1)
+            self._lib.llama_memory_seq_rm(memory, -1, self.n_tokens, -1)
 
             for i in range(0, len(tokens), self.n_batch):
                 batch = tokens[i: min(len(tokens), i + self.n_batch)]
                 n_past = self.n_tokens
                 n_tokens = len(batch)
 
-                self._batch.set_batch(batch=batch, n_past=n_past, logits_all=self.context_params.logits_all)
+                self._batch.set_batch(batch=batch, n_past=n_past, logits_all=self._logits_all)
 
                 return_code = self._lib.llama_decode(self._ctx.ctx, self._batch.batch)
 
-                #TODO: add better error handling if return_code 1 - usually overflow of ctx
+                # TODO: add better error handling if return_code 1 - usually overflow of ctx
                 if return_code != 0:
-                    raise RuntimeError(f"error: llama_decode call returned {return_code} - in most cases, this "
+                    raise RuntimeError(f"GGUFGenerativeModel - generate - llama_decode call returned {return_code} - in most cases, this "
                                        f"is due to exceeding the maximum context window.")
 
                 self.input_ids[n_past: n_past + n_tokens] = batch
                 rows = n_tokens
                 cols = self._n_vocab
-                offset = (0 if self.context_params.logits_all else n_tokens - 1)
+                offset = (0 if self._logits_all else n_tokens - 1)
 
-                self.scores[n_past + offset: n_past + n_tokens, :].reshape(-1)[:] = self._lib.llama_get_logits(self._ctx.ctx)[
-                                                                                    offset * cols: rows * cols]
+                if self._logits_all:
+                    rows = n_tokens
+                    cols = self._n_vocab
+                    logits = np.ctypeslib.as_array(
+                        self._ctx.get_logits(), shape=(rows * cols,))
+                    self.scores[n_past: n_past + n_tokens, :].reshape(-1)[::] = logits
 
                 self.n_tokens += n_tokens
+
+                # TODO: inserting test for logits
+                # self.register_top_logits()
 
             while sample_idx < self.n_tokens:
 
                 logits = self._scores[-1, :]
 
                 self.prev = list(self.eval_tokens)
-                token = self.sample(logits_array=logits)
 
-                #logger.debug("token: {token}")
+                # note: call to .sample_gguf method
+                token = self.sample_gguf(idx=sample_idx)  # (logits_array=logits)
 
-                self.accept(id=id,apply_grammar=None)
+                self.accept(id=id, apply_grammar=None)
 
                 tokens_created += 1
 
@@ -9022,12 +10537,14 @@ class GGUFGenerativeModel(BaseModel):
                 if sample_idx < self.n_tokens and token != self._input_ids[sample_idx]:
                     self.n_tokens = sample_idx
 
-                    self._lib.llama_kv_cache_seq_rm(self._ctx.ctx, -1, self.n_tokens, -1)
+                    self._lib.llama_memory_seq_rm(self._lib.llama_get_memory(self._ctx.ctx), -1, self.n_tokens, -1)
+                    # self._lib.llama_kv_cache_seq_rm(self._ctx.ctx, -1, self.n_tokens, -1)
 
                     break
 
                 if tokens_created > self.max_output_len:
-                    logger.info("update: GGUFGenerativeModel - stopping generation loop - reached limit of max output len")
+                    logger.info("GGUFGenerativeModel - stopping generation loop - reached limit of "
+                                "max output len")
                     break
 
     def tokenize(self, text, add_bos=True, special=False):
@@ -9036,145 +10553,41 @@ class GGUFGenerativeModel(BaseModel):
 
         n_ctx = self.n_ctx_train()
         tokens = (ctypes.c_int32 * n_ctx)()
-        n_tokens = self._lib.llama_tokenize(self._model.model, text, len(text), tokens, n_ctx, add_bos, special)
+        # change from self._model.model
+        n_tokens = self._lib.llama_tokenize(self.vocab, text, len(text), tokens, n_ctx, add_bos, special)
 
         if n_tokens < 0:
             n_tokens = abs(n_tokens)
             tokens = (ctypes.c_int32 * n_tokens)()
-            n_tokens = self._lib.llama_tokenize(self._model.model, text, len(text), tokens, n_tokens, add_bos, special)
+
+            n_tokens = self._lib.llama_tokenize(self.vocab, text, len(text), tokens, n_tokens, add_bos, special)
 
             if n_tokens < 0:
-                raise RuntimeError(f'error: GGUFGenerativeModel - tokenization error - "{text}" - n_tokens={n_tokens}')
+                raise RuntimeError(f"GGUFGenerativeModel - tokenization error - {text} - "
+                                   f"n_tokens={n_tokens}")
 
         return list(tokens[:n_tokens])
 
-    def detokenize(self, tokens, prev_tokens=None):
-
-        """ Detokenizes tokens, e.g., converts tokens back into a text string. """
-
+    def detokenize(self, tokens, special: bool = False) -> bytes:
         output = b""
         size = 32
         buffer = (ctypes.c_char * size)()
         for token in tokens:
-            n = self._lib.llama_token_to_piece(self._model.model, llama_token(token), buffer, size)
-
+            n = self._lib.llama_token_to_piece(
+                # replace: self.model
+                self.vocab, llama_token(token), buffer, size, 0, special
+            )
             assert n <= size
             output += bytes(buffer[:n])
 
-        # removes a leading space if the first token is a beginning of sentence token
-        return output[1:] if len(tokens) > 0 and tokens[0] == self.token_bos() else output
+        # NOTE: Llama1 models automatically added a space at the start of the prompt
+        # this line removes a leading space if the first token is a beginning of sentence token
 
-    def sample(self, idx=0, logits_array=None):
-
-        """ Sample applies the correct sampling method/strategy to obtain a token id. """
-
-        n_vocab = self.n_vocab()
-        id = 0
-
-        if logits_array is None:
-
-            logits = self._lib.llama_get_logits_ith(self._ctx.ctx, idx)
-
-            logits_array = np.array(
-                ctypes.cast(logits, ctypes.POINTER(ctypes.c_float * n_vocab)).contents,
-                dtype=np.single,
-            )
-
-        # apply logit_bias
-        for token, logit_bias in self.logit_bias.items():
-            logits_array[token] += logit_bias
-
-        token_data_array = _LlamaTokenDataArray(n_vocab=n_vocab)
-        token_data_array.copy_logits(logits_array)
-
-        # apply penalties
-        if len(self.prev) > 0:
-
-            nl_token = self.token_nl()
-
-            nl_logit = logits_array[nl_token]
-
-            # note: important to skip this if use_sampling is False
-            if self.penalty_last_n > 0 and self.use_sampling:
-
-                self._lib.llama_sample_repetition_penalties(self._ctx.ctx,
-                                                            ctypes.byref(token_data_array.candidates),
-                                                            (llama_token * len(self.prev))(*self.prev),
-                                                            self.penalty_last_n,
-                                                            self.penalty_repeat,
-                                                            self.penalty_freq,
-                                                            self.penalty_present,)
-
-            if not self.penalize_nl:
-                token_data_array.candidates_data["logit"][nl_token] = nl_logit
-
-        #   note: grammar implementation options  will be expanded over time
-        if self.grammar is not None:
-            self._lib.llama_sample_grammar(self._ctx.ctx, ctypes.byref(token_data_array.candidates), self.grammar.grammar, )
-
-        if self.temperature < 0:
-            assert self._ctx.ctx is not None
-
-            self._lib.llama_sample_softmax(self._ctx.ctx, ctypes.byref(token_data_array.candidates), )
-
-            #TODO - need to check/confirm this
-            id = token_data_array.candidates_data["id"][0][0]
-
-        elif self.temperature == 0 or not self.use_sampling:
-            assert self._ctx.ctx is not None
-
-            id = self._lib.llama_sample_token_greedy(self._ctx.ctx, ctypes.byref(token_data_array.candidates), )
-
-        else:
-
-            # note: mirostat sampling options are left here for completeness, but not fully exposed or tested
-            #   --implementation of mirostat will be expanded over time
-
-            if self.mirostat == 1:
-                mirostat_m = 100
-
-                assert self._ctx.ctx is not None
-
-                self._lib.llama_sample_temp(self._ctx.ctx, ctypes.byref(token_data_array.candidates), self.temperature)
-
-                self._lib.llama_sample_token_mirostat(self._ctx.ctx, ctypes.byref(token_data_array.candidates),
-                                                      self.mirostat_tau,
-                                                      self.mirostat_eta,
-                                                      mirostat_m,
-                                                      ctypes.pointer(self.mirostat_mu, ))
-
-            elif self.mirostat == 2:
-
-                self._lib.llama_sample_temp(self._ctx.ctx, ctypes.byref(token_data_array.candidates), self.temperature)
-
-                id = self._lib.llama_sample_token_mirostat_v2(self._ctx.ctx, ctypes.byref(token_data_array.candidates),
-                                                         self.mirostat_tau,
-                                                         self.mirostat_eta,
-                                                         ctypes.pointer(self.mirostat_mu), )
-
-            else:
-                min_keep = max(1, self.n_probs)
-
-                self._lib.llama_sample_top_k(self._ctx.ctx, ctypes.byref(token_data_array.candidates), self.top_k,
-                                        min_keep)
-
-                self._lib.llama_sample_tail_free(self._ctx.ctx, ctypes.byref(token_data_array.candidates), self.tfs_z,
-                                            min_keep)
-
-                self._lib.llama_sample_typical(self._ctx.ctx, ctypes.byref(token_data_array.candidates), self.typical_p,
-                                          min_keep)
-
-                self._lib.llama_sample_top_p(self._ctx.ctx, ctypes.byref(token_data_array.candidates), self.top_p,
-                                        min_keep)
-
-                self._lib.llama_sample_min_p(self._ctx.ctx, ctypes.byref(token_data_array.candidates), self.min_p,
-                                        min_keep)
-
-                self._lib.llama_sample_temp(self._ctx.ctx, ctypes.byref(token_data_array.candidates), self.temperature)
-
-                id = self._lib.llama_sample_token(self._ctx.ctx, ctypes.byref(token_data_array.candidates))
-
-        return id
+        return (
+            output[1:]
+            if len(tokens) > 0 and tokens[0] == self.token_bos() and output[0:1] == b" "
+            else output
+        )
 
     def accept(self, id, apply_grammar):
 
@@ -9189,7 +10602,7 @@ class GGUFGenerativeModel(BaseModel):
 
         """ Gets the top logits and keeps a running log for output analysis. """
 
-        #TODO:  there is issue with first logit computation - not corresponding to first token
+        # TODO:  there is issue with first logit computation - not corresponding to first token
         logit_pointer = self._lib.llama_get_logits(self._ctx.ctx)
 
         logit_size = self.n_vocab()
@@ -9204,9 +10617,9 @@ class GGUFGenerativeModel(BaseModel):
 
         top_logits = []
 
-        for x in range(0,self.top_logit_count):
+        for x in range(0, self.top_logit_count):
             # experiment - try rounding the float number
-            pair = (sm_args_sorted[logit_size-x-1],round(sm_sorted[logit_size-x-1],3))
+            pair = (sm_args_sorted[logit_size - x - 1], round(sm_sorted[logit_size - x - 1], 3))
             top_logits.append(pair)
 
         self.logits_record.append(top_logits)
@@ -9219,7 +10632,7 @@ class GGUFGenerativeModel(BaseModel):
 
         # set api_key
         os.environ[env_var] = api_key
-        logger.info("update: added and stored GGUF api_key in environmental variable- %s", env_var)
+        logger.info("GGUFGenerativeModel - added and stored GGUF api_key in environmental variable- %s", env_var)
 
         return self
 
@@ -9230,17 +10643,18 @@ class GGUFGenerativeModel(BaseModel):
         self.api_key = os.environ.get(env_var)
 
         if not self.api_key:
-            logger.error("error: _get_api_key could not successfully retrieve value from: %s ", env_var)
+            logger.error("GGUFGenerativeModel - _get_api_key could not successfully retrieve value from: %s ", env_var)
 
         return self.api_key
 
     def token_counter(self, text_sample):
 
-        """ Fast approximate token counter. """
+        if not text_sample:
+            tokens = 0
+        else:
+            tokens = len(self.tokenize(text_sample.encode("utf-8")))
 
-        tokenizer = Utilities().get_default_tokenizer()
-        toks = tokenizer.encode(text_sample).ids
-        return len(toks)
+        return tokens
 
     @property
     def ctx(self):
@@ -9266,7 +10680,7 @@ class GGUFGenerativeModel(BaseModel):
     def eval_logits(self):
         return deque(
             self.scores[: self.n_tokens, :].tolist(),
-            maxlen=self._n_ctx if self.context_params.logits_all else 1,
+            maxlen=self._n_ctx if self._logits_all else 1,
         )
 
     def reset(self):
@@ -9279,16 +10693,20 @@ class GGUFGenerativeModel(BaseModel):
         return self._lib.llama_n_ctx_train(self._model.model)
 
     def n_vocab(self):
-        return self._lib.llama_n_vocab(self._model.model)
+        n_vocab = self._lib.llama_n_vocab(self._lib.llama_model_get_vocab(self._model.model))
+        return n_vocab
 
     def token_eos(self):
-        return self._lib.llama_token_eos(self._model.model)
+        eos = self._lib.llama_token_eos(self.vocab)
+        return eos
 
     def token_bos(self):
-        return self._lib.llama_token_bos(self._model.model)
+        bos = self._lib.llama_token_bos(self.vocab)
+        return bos
 
     def token_nl(self):
-        return self._lib.llama_token_nl(self._model.model)
+        token_nl = self._lib.llama_token_nl(self._lib.llama_model_get_vocab(self._model.model))
+        return token_nl
 
     def unload_model(self):
 
@@ -9302,60 +10720,6 @@ class GGUFGenerativeModel(BaseModel):
         self._model = None
 
         return 0
-
-    def prompt_engineer(self, query, context, inference_dict):
-
-        """ Prompt engineering, packaging and templating. """
-
-        # if loaded model was not pretrained on instruction_following, then skip any instructions
-        if not self.instruction_following:
-
-            if context:
-                output = context + "\n" + query
-            else:
-                output = query
-
-            # unlikely that there would be an 'instruct wrapping' on text, but allow for possibility
-            if self.prompt_wrapper:
-                output = PromptCatalog().apply_prompt_wrapper(output, self.prompt_wrapper,
-                                                              instruction=None)
-
-            return output
-
-        # move ahead to add instructions and prompt engineering
-
-        if not self.add_prompt_engineering:
-            if context:
-                selected_prompt = "default_with_context"
-            else:
-                selected_prompt = "default_no_context"
-        else:
-            selected_prompt = self.add_prompt_engineering
-
-        prompt_dict = PromptCatalog().build_core_prompt(prompt_name=selected_prompt,
-                                                        separator=self.separator,
-                                                        query=query,
-                                                        context=context,
-                                                        inference_dict=inference_dict)
-
-        if prompt_dict:
-            prompt_engineered = prompt_dict["core_prompt"]
-        else:
-            # default case
-            prompt_engineered = "Please read the following text: " + context + self.separator
-            prompt_engineered += "Based on this text, please answer the question: " + query + self.separator
-            prompt_engineered += "Please answer the question only with facts provided in the materials.  " \
-                                 "If the question can not be answered in the materials, then please " \
-                                 "respond 'Not Found.'"
-
-        #   final wrapping, based on model-specific instruct training format
-        #   --provides a final 'wrapper' around the core prompt text, based on model expectations
-
-        if self.prompt_wrapper:
-            prompt_engineered = PromptCatalog().apply_prompt_wrapper(prompt_engineered, self.prompt_wrapper,
-                                                                     instruction=None)
-
-        return prompt_engineered
 
     def inference(self, prompt, add_context=None, add_prompt_engineering=None, api_key=None, inference_dict=None,
                   get_logits=False):
@@ -9384,9 +10748,9 @@ class GGUFGenerativeModel(BaseModel):
 
         #   show warning if function calling model
         if self.fc_supported:
-            logger.warning("warning: this is a function calling model - using .inference may lead to unexpected "
-                            "results.   Recommended to use the .function_call method to ensure correct prompt "
-                            "template packaging.")
+            logger.info("GGUFGenerativeModel - this is a function calling model - using .inference may lead to unexpected "
+                        "results. Recommended to use the .function_call method to ensure correct prompt "
+                        "template packaging.")
 
         # start with clean logits_record and output_tokens for each function call
         self.logits_record = []
@@ -9408,8 +10772,10 @@ class GGUFGenerativeModel(BaseModel):
 
         #   START - route to api endpoint
         if self.api_endpoint:
+            sd = self.to_state_dict()
             return self.inference_over_api_endpoint(self.prompt, context=self.add_context,
                                                     inference_dict=inference_dict)
+
         #   END - route to api endpoint
 
         text_prompt = self.prompt
@@ -9445,18 +10811,18 @@ class GGUFGenerativeModel(BaseModel):
         return output_response
 
     def function_call(self, context, function=None, params=None, get_logits=True,
-                      temperature=-99, max_output=None):
+                      temperature=-99.0, max_output=None):
 
         """ This is the key inference method for SLIM models - takes a context passage and a key list
         which is packaged in the prompt as the keys for python dictionary output"""
 
         if not self.fc_supported:
-            logger.warning("warning: GGUFGenerativeModel - loaded model does not support function calls.  "
-                            "Please either use the standard .inference method with this model, or use a GGUF "
-                            "model that has 'function_calls' key set to True in its model card.")
+            logger.warning("GGUFGenerativeModel - loaded model does not support function calls.  "
+                           "Please either use the standard .inference method with this model, or use a GGUF "
+                           "model that has 'function_calls' key set to True in its model card.")
             return []
 
-        self.context=context
+        self.context = context
 
         # start with clean logits_record and output_tokens for each function call
         self.logits_record = []
@@ -9469,8 +10835,8 @@ class GGUFGenerativeModel(BaseModel):
             self.primary_keys = params
 
         if not self.primary_keys:
-            logger.warning("warning: GGUF - function call - no keys provided - "
-                            "function call may yield unpredictable results")
+            logger.warning("GGUFGenerativeModel - function call - no keys provided - "
+                           "function call may yield unpredictable results")
 
         if not params:
             params = self.primary_keys
@@ -9478,7 +10844,7 @@ class GGUFGenerativeModel(BaseModel):
         if not function:
             #   pull from model card
             if self.function:
-                if isinstance(self.function,list):
+                if isinstance(self.function, list):
                     if len(self.function) > 0:
                         function = self.function[0]
                 else:
@@ -9496,6 +10862,7 @@ class GGUFGenerativeModel(BaseModel):
         #   START - route to api endpoint
 
         if self.api_endpoint:
+
             return self.function_call_over_api_endpoint(model_name=self.model_name,
                                                         context=self.context,params=self.primary_keys,
                                                         function=self.function,
@@ -9529,11 +10896,12 @@ class GGUFGenerativeModel(BaseModel):
         output_str = output_response["llm_response"]
 
         try:
+            import ast
             output_dict = ast.literal_eval(output_str)
 
             output_type = "dict"
-            if isinstance(output_dict,dict): output_type = "dict"
-            if isinstance(output_dict,list): output_type = "list"
+            if isinstance(output_dict, dict): output_type = "dict"
+            if isinstance(output_dict, list): output_type = "list"
 
             output_response["usage"].update({"type": output_type})
             output_response.update({"llm_response": output_dict})
@@ -9549,15 +10917,15 @@ class GGUFGenerativeModel(BaseModel):
                 output_type, output_rem = ModelCatalog().remediate_function_call_string(output_str)
 
                 if output_type != "string":
-                    output_response["usage"].update({"type": output_type, "remediation":True})
+                    output_response["usage"].update({"type": output_type, "remediation": True})
                     output_response.update({"llm_response": output_rem})
 
             if output_type == "string":
-                logger.warning("update: automatic conversion of function call output failed, and attempt to "
-                                "remediate was not successful - %s ", output_str)
+                logger.warning("GGUFGenerativeModel - function call - automatic conversion of function call output failed, and attempt to "
+                               "remediate was not successful - %s ", output_str)
             else:
-                logger.info("update: function call output could not be automatically converted, but remediation "
-                                "was successful to type - %s ", output_type)
+                logger.info("GGUFGenerativeModel - function call output could not be automatically converted, but remediation "
+                            "was successful to type - %s ", output_type)
 
         #   update linked to BaseModel
         self.prompt = ""
@@ -9574,7 +10942,7 @@ class GGUFGenerativeModel(BaseModel):
         return output_response
 
     def stream(self, prompt, add_context=None, add_prompt_engineering=None, api_key=None, inference_dict=None,
-                  get_logits=False, disable_eos=False):
+               get_logits=False, disable_eos=False, skip_pe_override=False):
 
         """ Main method for text streaming generation. Returns a generator function that yields one
         token at a time for real-time streaming to console or UI. """
@@ -9597,13 +10965,11 @@ class GGUFGenerativeModel(BaseModel):
             else:
                 self.add_prompt_engineering = "default_no_context"
 
-        #   end - update
-
         #   show warning if function calling model
         if self.fc_supported:
-            logger.warning("warning: this is a function calling model - using .inference may lead to unexpected "
-                            "results.   Recommended to use the .function_call method to ensure correct prompt "
-                            "template packaging.")
+            logger.info("GGUFGenerativeModel - this is a function calling model - using .inference may lead to unexpected "
+                           "results.  Recommended to use the .function_call method to ensure correct prompt "
+                           "template packaging.")
 
         # start with clean logits_record and output_tokens for each function call
         self.logits_record = []
@@ -9623,9 +10989,7 @@ class GGUFGenerativeModel(BaseModel):
         #   preview before generation
         self.preview()
 
-        # prompt = prompt
-
-        if self.add_prompt_engineering:
+        if self.add_prompt_engineering and not skip_pe_override:
             prompt_enriched = self.prompt_engineer(self.prompt, self.add_context, inference_dict=inference_dict)
             prompt_final = prompt_enriched
 
@@ -9637,10 +11001,14 @@ class GGUFGenerativeModel(BaseModel):
 
             prompt = prompt_final + self.trailing_space
 
-        # output_response = self._inference(text_prompt)
+        if self.api_endpoint:
+            """ Not implemented """
+            # continue with local execution ...
 
         #   starts _inference here
         completion_tokens = [] if len(prompt) > 0 else [self.token_bos()]
+
+        logger.info(f"GGUFGenerative - stream - model name - {self.model_name}")
 
         prompt_tokens = (
             (
@@ -9656,15 +11024,18 @@ class GGUFGenerativeModel(BaseModel):
         input_len = len(prompt_tokens)
         context_window = self.n_ctx()
 
+        logger.info(f"GGUFGenerativeModel stream - input token len - {input_len}")
+
         if input_len > context_window:
-            logger.warning("update: GGUFGenerativeModel - input is too long for model context window - truncating")
+            logger.warning("GGUFGenerativeModel - input is too long for model context window - truncating")
             min_output_len = 10
-            prompt_tokens = prompt_tokens[0:context_window-min_output_len]
+            prompt_tokens = prompt_tokens[0:context_window - min_output_len]
             input_len = len(prompt_tokens)
 
         text = b""
 
         # disable_eos = True
+        token_list = []
 
         for token in self.generate(prompt_tokens):
 
@@ -9681,14 +11052,22 @@ class GGUFGenerativeModel(BaseModel):
             if (input_len + len(completion_tokens)) >= context_window:
                 break
 
-            new_token = self.detokenize([token]).decode('utf-8',errors='ignore')
+            new_token = self.detokenize([token]).decode('utf-8', errors='ignore')
+
+            # a little cleanup of 'think' tokens
+            if new_token == "<think>":
+                new_token = "<|think|>"
+                logger.info(f"GGUFGenerativeModel - stream -  changing token to markdown safe - {new_token}")
+
+            if new_token == "</think>":
+                new_token = "<|endthink|>"
 
             yield new_token
 
         text_str = text.decode("utf-8", errors="ignore")
 
         #   turned off
-        #   self.register()
+        self.register()
 
         return text_str
 
@@ -9700,8 +11079,8 @@ class GGUFGenerativeModel(BaseModel):
 
         #   send to api agent server
 
-        self.context=context
-        self.tool_type=tool_type
+        self.context = context
+        self.tool_type = tool_type
 
         import ast
         import requests
@@ -9744,6 +11123,7 @@ class GGUFGenerativeModel(BaseModel):
             #   will attempt to unpack logits - but catch any exceptions and skip
             if "logits" in output:
                 try:
+                    import ast
                     logits = ast.literal_eval(output["logits"])
                     output["logits"] = logits
                 except:
@@ -9760,19 +11140,9 @@ class GGUFGenerativeModel(BaseModel):
                     output["output_tokens"] = []
 
             # output = ast.literal_eval(output_raw.text)
-            """
-            output = json.loads(output_raw.text)
-            if "logits" in output:
-                logits = ast.literal_eval(output["logits"])
-                logger.debug(f"logits: {logits}")
-                output["logits"] = logits
-            if "output_tokens" in output:
-                ot_int = [int(x) for x in output["output_tokens"]]
-                output["output_tokens"] = ot_int
-            """
 
         except:
-            logger.warning("warning: api inference was not successful")
+            logger.warning("GGUFGenerativeModel - function_call_over_api_endpoint - api inference was not successful")
             output = {"llm_response": "api-inference-error", "usage": {}}
 
         #   update linked to BaseModel
@@ -9817,6 +11187,7 @@ class GGUFGenerativeModel(BaseModel):
             #   will attempt to unpack logits - but catch any exceptions and skip
             if "logits" in output:
                 try:
+                    import ast
                     logits = ast.literal_eval(output["logits"])
                     output["logits"] = logits
                 except:
@@ -9825,6 +11196,7 @@ class GGUFGenerativeModel(BaseModel):
             #   will attempt to unpack output tokens - but catch any exceptions and skip
             if "output_tokens" in output:
                 try:
+                    import ast
                     # ot_int = [int(x) for x in output["output_tokens"]]
                     # output["output_tokens"] = ot_int
                     output_tokens = ast.literal_eval(output["output_tokens"])
@@ -9871,7 +11243,6 @@ class WhisperCPPModel(BaseModel):
 
         #   set verbose level in environ level - will be picked up by callback in whisper_cpp
         os.environ["whisper_cpp_verbose"] = GGUFConfigs().get_config("whisper_cpp_verbose")
-
         self.WHISPER_SR = GGUFConfigs().get_config("whisper_sr")
         self.strategy = GGUFConfigs().get_config("whisper_strategy")
         self.n_threads = GGUFConfigs().get_config("whisper_threads")
@@ -9892,6 +11263,11 @@ class WhisperCPPModel(BaseModel):
         self.temperature = 0.0
         self.duration = 0
         self.translate = False
+
+        if sys.platform.lower() == "darwin":
+            self.whisper_use_legacy_mac = GGUFConfigs().get_config("whisper_use_legacy_mac")
+        else:
+            self.whisper_use_legacy_mac = False
 
         #   new option to 'force' use of cuda lib, and over-ride safety checks
         if GGUFConfigs().get_config("force_gpu"):
@@ -9945,22 +11321,22 @@ class WhisperCPPModel(BaseModel):
 
         self.model_path = os.path.join(model_repo_path, self.gguf_file)
         self.context = self._lib.whisper_init_from_file(self.model_path.encode('utf-8'))
+
         self.params = self._lib.whisper_full_default_params(self.strategy)
 
         self.params.n_threads = self.n_threads
-        self.params.print_special = True
-        self.params.print_progress = False
+        # self.params.print_special = True
+        # self.params.print_progress = False
 
         # set to True by default - will display in 'real-time' the transcription
-        self.params.print_realtime = GGUFConfigs().get_config("whisper_cpp_realtime_display")
-
-        self.params.print_timestamps = True
-        self.params.tdrz_enable = self.tiny_diarize
-        self.params.progress_callback = whisper_progress_callback(self.callback)
-        self.params.temperature_inc = self.temperature_inc
-        self.params.token_timestamps = True
-        self.params.greedy.best_of = self.greedy_best_of
-        self.params.beam_search.beam_size = self.beam_size
+        # self.params.print_realtime = GGUFConfigs().get_config("whisper_cpp_realtime_display")
+        # self.params.print_timestamps = True
+        # self.params.tdrz_enable = self.tiny_diarize
+        # self.params.progress_callback = whisper_progress_callback(self.callback)
+        # self.params.temperature_inc = self.temperature_inc
+        # self.params.token_timestamps = True
+        # self.params.greedy.best_of = self.greedy_best_of
+        # self.params.beam_search.beam_size = self.beam_size
 
         return self
 
@@ -9978,13 +11354,13 @@ class WhisperCPPModel(BaseModel):
             if os.path.exists(custom_path):
                 _lib_paths = [custom_path]
             else:
-                raise ModuleNotFoundException("custom-whisper-cpp-lib")
-
+                raise LLMWareException(message=f"WhisperCPPModel - attempted to load whisper cpp backend lib - "
+                                               f"could not find path to custom lib - {custom_path}")
         else:
 
             # general case - will look for llama.cpp dynamic library included with llmware
 
-            _base_path = os.path.join(LLMWareConfig.get_config("shared_lib_path"), "whisper")
+            _base_path = os.path.join(LLMWareConfig.get_config("shared_lib_path"), "gguf")
 
             _lib_paths = []
 
@@ -9993,63 +11369,54 @@ class WhisperCPPModel(BaseModel):
             # Determine the file extension based on the platform
             if system_platform.startswith("linux"):
 
-                if self.use_gpu:
-                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("whisper_linux_cuda")))
+                machine = os.uname().machine.lower()
+
+                if machine == "aarch64" and self.use_gpu:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_aarch64_cuda_lib"),
+                                                   GGUFConfigs().get_config("whisper_dgx")))
+
+                elif self.use_gpu:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_cuda_lib"),
+                                                   GGUFConfigs().get_config("whisper_linux_cuda")))
 
                     # new - will try to use x86 as fallback
-                    fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("whisper_linux_x86"))
+                    fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("linux_x86_lib"),
+                                                    GGUFConfigs().get_config("whisper_linux_x86"))
 
                 else:
-                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("whisper_linux_x86")))
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_x86_lib"),
+                                                   GGUFConfigs().get_config("whisper_linux_x86")))
 
             elif system_platform == "darwin":
 
-                machine = os.uname().machine.lower()
-
-                if machine == 'x86_64':
-                    raise LLMWareException("ModuleNotFound Exception - detected MacOS on x86_64 (e.g., not M1/M2/M3). "
-                                           "LLMWare does not ship with a whisper_cpp module for this platform.  To use "
-                                           "WhisperCPPModel will require a custom build whisper_cpp module.  For more "
-                                           "details, please go to the llmware github site, or directly to the "
-                                           "Whisper CPP source: https://www.github.com/ggerganov/whisper.cpp.git")
-
-                    # _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("whisper_mac_x86")))
+                if not self.whisper_use_legacy_mac:
+                    mac_lib = GGUFConfigs().get_config("whisper_mac_metal")
                 else:
+                    mac_lib = GGUFConfigs().get_config("whisper_mac_metal_legacy")
 
-                    if GGUFConfigs().get_config("use_macos_accelerate"):
-
-                        try:
-                            import platform
-                            macos_ver = platform.mac_ver()
-                            if len(macos_ver) > 0:
-                                ver = macos_ver[0].split(".")
-
-                                v1 = int(ver[0])
-                                v2 = int(ver[1])
-
-                                if v1 < 14:
-
-                                    logger.warning(f"warning: detected older version of macos - {macos_ver} - "
-                                                    f"which may produce errors related to the Accelerate framework.\n"
-                                                    f"To remove this warning: (1) upgrade to Sonoma (>14.0) or \n(2) set "
-                                                    f"GGUF configs to use non Accelerate binary by default:\n"
-                                                    f"GGUFConfigs().set_config('use_macos_accelerate', False)")
-
-                        except:
-                            pass
-
-                        _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("whisper_mac_metal")))
-
-                        fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("whisper_mac_metal_no_acc"))
-
-                    else:
-                        _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("whisper_mac_metal_no_acc")))
-
-                    # _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("whisper_mac_metal")))
+                _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("mac_metal_lib"),mac_lib))
 
             elif sys.platform == "win32":
 
-                _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("whisper_windows")))
+                import platform
+
+                if platform.machine().lower() == "arm64":
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_arm64_lib"),
+                                                   GGUFConfigs().get_config("whisper_windows_arm64")))
+
+                # windows cuda
+                elif self.use_gpu:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_cuda_lib"),
+                                                   GGUFConfigs().get_config("whisper_windows")))
+
+                    # new - will try to use x86 as fallback
+                    fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("windows_x86_lib"),
+                                                    GGUFConfigs().get_config("whisper_windows"))
+
+                else:
+                    # main case - windows x86
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_x86_lib"),
+                                                   GGUFConfigs().get_config("whisper_windows")))
 
         # Add the library directory to the DLL search path on Windows (if needed)
         # if sys.platform == "win32" and sys.version_info >= (3, 8): os.add_dll_directory(str(_base_path))
@@ -10115,7 +11482,8 @@ class WhisperCPPModel(BaseModel):
                 self.remove_segment_markers = inference_dict["remove_segment_markers"]
 
         #   preview before starting inference
-        self.preview()
+
+        # self.preview()
 
         #   note: updated dependencies for improved efficiency
         #   previously, used librosa library
@@ -10197,9 +11565,8 @@ class WhisperCPPModel(BaseModel):
         if prompt:
             self.params.initial_prompt = prompt.encode('utf-8')
 
-        self.params.temperature = self.temperature
-
-        self.params.translate = self.translate
+        # self.params.temperature = self.temperature
+        # self.params.translate = self.translate
 
         result = self._generate(data)
 
@@ -10336,9 +11703,17 @@ class WhisperCPPModel(BaseModel):
         self._lib.whisper_init_from_file.restype = ctypes.c_void_p
 
         self._lib.whisper_full_default_params.argtypes = [ctypes.c_int]
-        self._lib.whisper_full_default_params.restype = whisper_full_params
 
-        self._lib.whisper_full.argtypes = [ctypes.c_void_p, whisper_full_params, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
+        if not self.whisper_use_legacy_mac:
+            self._lib.whisper_full_default_params.restype = whisper_full_params
+        else:
+            self._lib.whisper_full_default_params.restype = whisper_full_params_legacy
+
+        if not self.whisper_use_legacy_mac:
+            self._lib.whisper_full.argtypes = [ctypes.c_void_p, whisper_full_params, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
+        else:
+            self._lib.whisper_full.argtypes = [ctypes.c_void_p, whisper_full_params_legacy, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
+
         self._lib.whisper_full.restype = ctypes.c_int
 
         self._lib.whisper_full_n_segments.argtypes = [ctypes.c_void_p]
@@ -10565,329 +11940,114 @@ class ModelResources:
         return getattr(cls._ModelState, model_name)
 
 
-class LLMWareInferenceServer:
+class MultiModalModel:
+    """A class to handle multi-modal models, supporting text, image, and other data types."""
 
-    """ LLMWare Inference Server class implements server-side lightweight inference server with two
-    primary APIs currently supported:
-
-        1.  /      - main inference of general purpose LLM deployed on inference server at time of start.
-        2.  /agent - supports agent process over API with multiple SLIM models deployed.
-
-    """
-
-    def __init__(self, model_name, model_catalog=None, hf_api_key=None, secret_api_key=None, home_path=None,
-                 port=8080, verbose=True, temperature=0.0, sample=False, max_output=100, debug=False):
-
-        self.HOME_PATH = home_path
-        self.hf_api_key = hf_api_key
-        self.current_api_key = secret_api_key
-        self.port = port
-
-        if not model_catalog:
-            self.model_catalog = ModelCatalog()
-        else:
-            self.model_catalog = model_catalog
-
+    def __init__(self, model_name, model_type, preprocessors=None, postprocessors=None):
         self.model_name = model_name
-        self.model = self.model_catalog.load_model(model_name, api_key=self.hf_api_key,
-                                                   temperature=temperature, sample=sample, max_output=max_output)
+        self.model_type = model_type
+        self.preprocessors = preprocessors or {}
+        self.postprocessors = postprocessors or {}
 
-        self.verbose = verbose
+    def add_preprocessor(self, data_type, preprocessor):
+        """Add a preprocessor for a specific data type."""
+        self.preprocessors[data_type] = preprocessor
 
-        import logging
-        logging.basicConfig(level=30)
-        global inference_server_logger
-        inference_server_logger = logging.getLogger("inference_server_logger")
+    def add_postprocessor(self, data_type, postprocessor):
+        """Add a postprocessor for a specific data type."""
+        self.postprocessors[data_type] = postprocessor
 
-        if debug:
-            inference_server_logger.setLevel(level=10)
+    def preprocess(self, data_type, data):
+        """Preprocess data based on its type."""
+        if data_type in self.preprocessors:
+            return self.preprocessors[data_type](data)
+        return data
+
+    def postprocess(self, data_type, data):
+        """Postprocess data based on its type."""
+        if data_type in self.postprocessors:
+            return self.postprocessors[data_type](data)
+        return data
+
+    def inference(self, inputs):
+        """Perform inference on multi-modal inputs."""
+        processed_inputs = {
+            data_type: self.preprocess(data_type, data)
+            for data_type, data in inputs.items()
+        }
+        # Placeholder for model inference logic
+        raw_outputs = self._run_model(processed_inputs)
+        return {
+            data_type: self.postprocess(data_type, output)
+            for data_type, output in raw_outputs.items()
+        }
+
+    def _run_model(self, inputs):
+        """Run the model on preprocessed inputs based on the model type."""
+        if not hasattr(self, 'model') or self.model is None:
+            raise ValueError("Model is not loaded. Please load a model before running inference.")
+
+        if self.model_type == "pytorch":
+            # PyTorch inference
+            import torch
+            input_tensors = {
+                data_type: torch.tensor(data) if isinstance(data, list) else torch.from_numpy(data)
+                for data_type, data in inputs.items()
+            }
+            with torch.no_grad():
+                outputs = {
+                    data_type: self.model(input_tensor.unsqueeze(0))
+                    for data_type, input_tensor in input_tensors.items()
+                }
+            return {data_type: output.squeeze(0).numpy() for data_type, output in outputs.items()}
+
+        elif self.model_type == "onnx":
+            # ONNX inference
+            import onnxruntime as ort
+            session = ort.InferenceSession(self.model)
+            outputs = {
+                data_type: session.run(None, {session.get_inputs()[0].name: data})[0]
+                for data_type, data in inputs.items()
+            }
+            return outputs
+
+        elif self.model_type == "openvino":
+            # OpenVino inference
+            from openvino.runtime import Core
+            core = Core()
+            compiled_model = core.compile_model(self.model, "CPU")
+            outputs = {
+                data_type: compiled_model([data])[0]
+                for data_type, data in inputs.items()
+            }
+            return outputs
+
+        elif self.model_type == "gguf":
+            # GGUF inference (example placeholder)
+            # Assuming GGUF uses a specific library for inference
+            from llmware.gguf_configs import GGUFInference
+            gguf_inference = GGUFInference(self.model)
+            outputs = {
+                data_type: gguf_inference.run(data)
+                for data_type, data in inputs.items()
+            }
+            return outputs
+        
+        elif self.model_type == "tensorflow":
+            # TensorFlow inference
+            import tensorflow as tf
+            input_tensors = {
+                data_type: tf.convert_to_tensor(data) if isinstance(data, list) else tf.constant(data)
+                for data_type, data in inputs.items()
+            }
+            outputs = {
+                data_type: self.model(input_tensor[None, ...])
+                for data_type, input_tensor in input_tensors.items()
+            }
+            return {data_type: output.numpy() for data_type, output in outputs.items()}
+        
         else:
-            if self.verbose:
-                # set logging at "INFO"
-                inference_server_logger.setLevel(level=20)
-            else:
-                # keep logging at "WARNING"
-                inference_server_logger.setLevel(level=30)
-
-    def start(self):
-
-        """ Starts the server runtime. """
-        # if inference server started, then try to get flask dependency
-        try:
-            global flask
-            from flask import Flask, request, jsonify
-        except:
-            raise DependencyNotInstalledException("flask")
-
-        app = Flask(__name__, template_folder=self.HOME_PATH, static_folder=self.HOME_PATH)
-        app.add_url_rule("/", methods=['GET', 'POST'], view_func=self.index_route)
-        app.add_url_rule("/agent", methods=['GET','POST'], view_func=self.agent_route)
-
-        #TODO:  WIP - explicit /load_model path not fully implemented yet
-        app.add_url_rule("/load_model", methods=['GET','POST'], view_func=self.load_model_route)
-
-        app.config.update(
-            TESTING=True,
-            # note: this is not a real secret key - it is just random letters
-            SECRET_KEY='asdasdsaddfdsggsdfdsfsdggdsd',
-            SEND_FILE_MAX_AGE_DEFAULT=0,
-            MAX_CONTENT_LENGTH=1000 * 1024 * 1024
-        )
-
-        # launch server
-        my_host = '0.0.0.0'
-        my_port = self.port
-        app.run(host=my_host, port=my_port)
-
-    def _llmware_inference(self, prompt, context, model_name):
-
-        """ Executes a LLM model inference from the main index route. """
-
-        t1 = time.time()
-
-        if not ModelResources().check_if_model_loaded(model_name):
-            self._load_model(model_name, get_logits=False, sample=False,temperature=0.0, max_output=200)
-
-        model = ModelResources().fetch_model(model_name)
-
-        output = model.inference(prompt, add_context=context, add_prompt_engineering=True)
-
-        if "logits" in output:
-            output["logits"] = str(output["logits"])
-
-        t2 = time.time()
-
-        inference_server_logger.info(f"update: model inference output - {output['llm_response']} - {output['usage']}")
-        inference_server_logger.info(f"update: total processing time: {t2-t1}")
-
-        return output
-
-    def index_route(self):
-
-        """ Main index route to execute a model inference from the server. """
-
-        # defaults
-        api_key = ""
-        question = ""
-        context = ""
-        model_name = ""
-
-        # if inference server started, then try to get flask dependency
-        try:
-            from flask import Flask, request, jsonify
-        except:
-            raise DependencyNotInstalledException("flask")
-
-        for keys in request.form:
-
-            inference_server_logger.debug(f"update: keys / values input received - {keys} - {request.form.get(keys)}")
-
-            if keys == "context":
-                context = request.form.get(keys)
-
-            if keys == "question":
-                question = request.form.get(keys)
-
-            if keys == "max_output_tokens":
-                max_output_len = request.form.get(keys)
-                try:
-                    max_output_len = int(max_output_len)
-                except:
-                    max_output_len = 200
-
-            if keys == "api_key":
-                api_key = request.form.get(keys)
-
-            if keys == "model_name":
-                model_name = request.form.get(keys)
-
-        t1 = time.time()
-
-        if not question and not context:
-            output_str = "Got your message - No content found to process"
-            return jsonify({"message": output_str})
-
-        if api_key != self.current_api_key:
-            output_str = "Got your message - Thanks for testing - API key not confirmed!"
-            return jsonify({"message": output_str})
-
-        if not model_name:
-            model_name = self.model_name
-        # start processing here
-
-        output = self._llmware_inference(question, context, model_name)
-
-        # cuda.empty_cache()
-
-        return jsonify(output)
-
-    def agent_route(self):
-
-        """ New InferenceServer API Route - to handle an Agent process deployed over a Remote Endpoint server. """
-
-        try:
-            from flask import Flask, request, jsonify
-        except:
-            raise DependencyNotInstalledException("flask")
-
-        context = ""
-        fx = ""
-        model = ""
-        params = []
-        get_logits = False
-        prompt = ""
-        temperature = 0.0
-        sample = False
-        api_key = ""
-        max_output = 50
-        tool_type = ""
-
-        for keys in request.form:
-
-            inference_server_logger.debug(f"update: keys / values input received: {keys} - {request.form.get(keys)}")
-
-            if keys == "context":
-                context = request.form.get(keys)
-
-            if keys == "tool_type":
-                tool_type = request.form.get(keys)
-
-            if keys == "function":
-                fx = request.form.get(keys)
-
-            if keys == "model" or keys == "model_name":
-                model = request.form.get(keys)
-
-            if keys == "params":
-                params = request.form.get(keys)
-
-            if keys == "get_logits":
-
-                get_logits = request.form.get(keys)
-
-                if get_logits in ["False", "false"]:
-                    get_logits = False
-                if get_logits in ["True", "true"]:
-                    get_logits =True
-
-            if keys == "temperature":
-                temperature = request.form.get(keys)
-
-            if keys == "sample":
-                sample = request.form.get(keys)
-
-            if keys == "question" or keys == "prompt":
-                prompt = request.form.get(keys)
-
-            if keys == "max_output_tokens" or keys == "max_output":
-                max_output_len = request.form.get(keys)
-                try:
-                    max_output = int(max_output_len)
-                except:
-                    max_output = 200
-
-            if keys == "api_key":
-                api_key = request.form.get(keys)
-
-        t1 = time.time()
-
-        if not context and not (fx or model):
-            output_str = "Got your message - No content found to process"
-            return jsonify({"message": output_str})
-
-        if api_key != self.current_api_key:
-            output_str = "Got your message - Thanks for testing - API key not confirmed!"
-            return jsonify({"message": output_str})
-
-        # start processing here
-
-        output = self._llmware_agent_function_call(context=context, tool_type=tool_type, model_name=model, function=fx,
-                                                  temperature=temperature, sample=sample,params=params,
-                                                  max_output=max_output, prompt=prompt,get_logits=get_logits)
-        # cuda.empty_cache()
-
-        return jsonify(output)
-
-    def _llmware_agent_function_call(self, prompt=None, context=None, tool_type=None, model_name=None,
-                                    function=None, temperature=0.0, sample=False, params=None,
-                                    max_output=50, get_logits=False):
-
-        """ Executes the function call inside the agent route. """
-
-        if tool_type:
-            model_name = _ModelRegistry().get_llm_fx_mapping()[tool_type]
-
-        temperature = float(temperature)
-        max_output = int(max_output)
-
-        inference_server_logger.debug(f"update: llmware_agent_function_call - {model_name} - {tool_type}")
-
-        if not ModelResources().check_if_model_loaded(model_name):
-            self._load_model(model_name, get_logits=True,sample=False,temperature=0.0,max_output=max_output)
-
-        model = ModelResources().fetch_model(model_name)
-
-        if tool_type not in ["sql", "answer"]:
-            # fc = getattr(model, "function_call")
-            output = model.function_call(context,function=function,params=[params], get_logits=get_logits,
-                                         max_output=max_output, temperature=temperature)
-        else:
-            # inference = getattr(model, "inference")
-            output = model.inference(prompt,add_context=context,add_prompt_engineering="default_with_context",
-                                     get_logits=get_logits)
-
-        inference_server_logger.info(f"update: llmware_agent_function_call - model_response - {output['llm_response']} "
-                                     f"- {output['usage']}")
-
-        if "logits" in output:
-            output["logits"] = str(output["logits"])
-
-        return output
-
-    def load_model_route(self):
-
-        """ Load Model route is an explicit step to load a model into the server persistent state -
-        not fully implemented yet - WIP. """
-
-        output = {}
-        model_name = ""
-        tool = ""
-
-        # if inference server started, then try to get flask dependency
-        try:
-            from flask import Flask, request, jsonify
-        except:
-            raise DependencyNotInstalledException("flask")
-
-        for keys in request.form:
-
-            inference_server_logger.debug(f"update: keys / values input received - {keys} - {request.form.get(keys)}")
-
-            if keys == "model" or keys == "model_name":
-                model_name = request.form.get(keys)
-
-            if keys == "tool" or keys == "tool_type":
-                tool = request.form.get(keys)
-
-        if tool and not model_name:
-            model_name = _ModelRegistry().get_llm_fx_mapping()[tool]
-
-        if model_name:
-            self._load_model(model_name)
-            output = {"model": f"loaded-{model_name}"}
-
-        return jsonify(output)
-
-    def _load_model(self, model_name, sample=False, temperature=0.0, get_logits=False,max_output=200):
-
-        if not ModelResources().check_if_model_loaded(model_name):
-            ModelResources().load_model(model_name, sample=sample, temperature=temperature, get_logits=get_logits,
-                                        max_output=max_output)
-        else:
-            inference_server_logger.debug(f"model already loaded - {model_name}")
-
-        return True
-
+            raise ValueError(f"Unsupported model type: {self.model_type}")
 
 class PyTorchLoader:
 
@@ -11170,3 +12330,3890 @@ class CustomPTLoader:
         return tokenizer
 
 
+class WindowsLocalFoundryHandler:
+
+    """ Main handler for interface with Windows Local Foundry integration.
+    Model inferencing handled by implementation of WindowsLocalFoundryModel,
+    which subclasses BaseModel and mirrors closely the OpenAIModel class. """
+
+    def __init__(self):
+
+        self.model_id = ""
+        self.api_key = ""
+        self.base_url = None
+
+    def get_manager(self):
+
+        """ Checks if manager instance already created, and if not, creates new one.
+            This is the single entry point to get access to low level manager. """
+
+        foundry_mgr = _ModelRegistry().get_foundry_manager()
+
+        if not foundry_mgr:
+
+            try:
+                from foundry_local import FoundryLocalManager
+            except:
+                logger.warning(f"WindowsLocalFoundryHandler - could not "
+                               f"load FoundryLocalManager SDK")
+                return None
+
+            # optional - check local uri
+            # from foundry_local.service import get_service_uri
+            # uri = get_service_uri()
+
+            # create new manager and save in ModelHQ state
+            foundry_mgr = _ModelRegistry().set_foundry_manager(FoundryLocalManager())
+
+            if foundry_mgr:
+                if hasattr(foundry_mgr, "endpoint"):
+                    self.base_url = foundry_mgr.endpoint
+
+        return foundry_mgr
+
+    def activate_catalog(self, activate_status):
+
+        """ Connect with Windows Local Foundry, poll for latest model list
+        and activate in the LLMWare Model Catalog. """
+
+        result = True
+
+        mgr = self.get_manager()
+        if not mgr:
+            logger.info(f"Service not available - can not activate catalog")
+            activate_status = False
+            result = False
+
+        if activate_status:
+
+            if not self.is_server_started():
+                self.start_server()
+
+            # get available models + create ext catalog
+            model_list = self.create_model_catalog_extension()
+
+            for model in model_list:
+                _ModelRegistry().add_model(model)
+                mn = model.get("model_name", "")
+                logger.info(f"WindowsLocalFoundryManager - adding foundry model - {mn}")
+
+        else:
+
+            # remove instance from state
+            _ModelRegistry().reset_foundry_manager()
+
+        return result
+
+    def test_foundry(self):
+
+        """ Confirm that server has started and is running. """
+
+        mgr = self.get_manager()
+
+        if not mgr:
+            explanation = ("LocalFoundry Manager could not be created - "
+                           "service does not appear to be available.")
+            return False, explanation
+
+        started = self.is_server_started()
+
+        if started:
+            return True, "Server has started"
+
+        else:
+            # not started
+            pass
+
+        if mgr:
+            if hasattr(mgr, "endpoint"):
+                self.base_url = mgr.endpoint
+            if hasattr(mgr, "api_key"):
+                self.api_key = mgr.api_key
+
+        return True, "Server Available but not Started"
+
+    def start_server_if_needed(self):
+
+        """ Start Windows Local Foundry server, if needed. """
+
+        if not self.is_server_started():
+            self.start_server()
+
+        return True
+
+    def is_server_started(self):
+
+        """ Check if Windows Local Foundry server has been started. """
+
+        mgr = self.get_manager()
+        started = False
+        if mgr:
+            started = mgr.is_service_running()
+        return started
+
+    def start_server(self):
+
+        """ Start Windows Local Foundry server. """
+
+        mgr = self.get_manager()
+        x = mgr.start_service()
+        return True
+
+    def stop_server(self):
+
+        """ Stop Windows Local Foundry server. """
+
+        import subprocess
+        cmd_args = "foundry service stop"
+
+        try:
+            subprocess.Popen(cmd_args, shell=True)
+            logger.info(f"WindowsLocalFoundryModel - server "
+                        f"stopped successfully")
+
+        except:
+            logger.info(f"WindowsLocalFoundryModel - tried to stop server - "
+                        f"unsuccessful - skipping")
+
+        return True
+
+    def check_if_cached(self, model_name):
+
+        """ Check if model is cached in .foundry locally """
+
+        is_cached = False
+
+        if model_name.endswith("-foundry"):
+            model_name = model_name[0:-len("-foundry")]
+
+        mgr = self.get_manager()
+
+        if not mgr:
+            return False
+
+        cached_models = mgr.list_cached_models()
+
+        # check if selected model in cache
+        for model in cached_models:
+
+            # model_id = model.id
+            # model_alias = model.alias
+            if model_name in [model.id, model.alias]:
+
+                is_cached = True
+                break
+
+        return is_cached
+
+    def download_if_needed(self, model_name):
+
+        """ Download local foundry manager, if not cached """
+
+        is_cached = self.check_if_cached(model_name)
+        if not is_cached:
+            confirmation = self.download_model(model_name)
+
+        return True
+
+    def download_model(self, model_name):
+
+        """ Download model through Windows Local Foundry """
+
+        # Download and load a model
+        mgr = self.get_manager()
+        model_info = mgr.download_model(model_name)
+
+        return model_info
+
+    def load_model(self, model_name,auto_unload=True):
+
+        """ Load model from local .foundry cache """
+
+        mgr = self.get_manager()
+        mgr.load_model(model_name)
+
+        return True
+
+    def unload_model(self, model_name):
+
+        """ Unload model from Windows Local Foundry """
+
+        mgr = self.get_manager()
+        mgr.unload_model(model_name)
+        return True
+
+    def list_all_models(self):
+
+        """ List all models available in Foundry Local repository """
+
+        # List available models in the catalog
+        mgr = self.get_manager()
+        catalog = mgr.list_catalog_models()
+
+        # alias | id | version | device_type | runtime | uri | file_size prompt_template | prompt
+        # device_type - CPU | GPU | NPU
+
+        return catalog
+
+    def release_all_models(self):
+
+        """ Release all models from Windows Local Foundry """
+
+        # safety check for Windows Local Foundry
+
+        response = False
+
+        if self.is_server_started():
+            response = True
+            mgr = self.get_manager()
+            list_loaded_models = mgr.list_loaded_models()
+            if list_loaded_models:
+                for model in list_loaded_models:
+
+                    mgr.unload_model(model.id, force=True)
+                    logger.info(f"release_all_models - unloading model - {model.id}")
+
+                    list_loaded_models = mgr.list_loaded_models()
+                    logger.info(f"release_all_models - updated loaded models - "
+                                f"{list_loaded_models}")
+
+        return response
+
+    def _estimate_params(self, file_size_mb):
+
+        """ Quick estimation of the parameter count based on
+        binary file size of .foundry asset. """
+
+        # if no indicator found
+        default_params = 3
+
+        if file_size_mb >= 7000:
+            params = 14
+            return params
+
+        elif 3000 <= file_size_mb < 7000:
+            params = 7
+            return params
+
+        elif 1000 <= file_size_mb < 3000:
+            params = 3
+            return params
+
+        elif 100 <= file_size_mb < 1000:
+            params = 1
+            return params
+
+        else:
+            # default - unexpected
+            return default_params
+
+    def create_model_catalog_extension(self):
+
+        """ Create model catalog entry """
+
+        mc_ext = []
+        models = self.list_all_models()
+        names_only = []
+
+        for m in models:
+
+            new_card = {}
+            ctx = 8192
+
+            model_mb = m.file_size_mb
+            params = self._estimate_params(model_mb)
+
+            device_type = ""
+            if hasattr(m, "device_type"):
+                device_type = m.device_type
+
+            if device_type not in ["CPU", "GPU", "NPU"]:
+                if "npu" in m.id:
+                    device_type = "NPU"
+                elif "gpu" in m.id:
+                    device_type = "GPU"
+                elif "cpu" in m.id:
+                    device_type = "CPU"
+                else:
+                    device_type = "CPU"
+
+            if m.id not in names_only:
+
+                new_card.update({"model_name": m.id + "-foundry"})
+
+                # keep m.id for uniqueness (rather than m.alias)
+                new_card.update({"display_name": m.id + "-foundry"})
+
+                new_card.update({"model_family": "WindowsLocalFoundryModel"})
+                new_card.update({"model_category": "generative-api"})
+                new_card.update({"device_type": device_type})
+                new_card.update({"parameters": params})
+                new_card.update({"model_location": "api"})
+                new_card.update({"context_window": ctx})
+                new_card.update({"tags": ["llmware-chat", f"p{params}",
+                                          "windows_local_foundry",
+                                          "green", "emerald", "api"]})
+
+                mc_ext.append(new_card)
+                names_only.append(m.id)
+
+        return mc_ext
+
+    def list_all_cached_models(self):
+
+        """ List all locally cached models in .foundry """
+
+        model_list = []
+        # List models in cache
+        mgr = self.get_manager()
+        local_models = mgr.list_cached_models()
+        logger.info(f"Models in cache - {local_models}")
+        return model_list
+
+
+class WindowsLocalFoundryModel(BaseModel):
+
+    """ WindowsLocalFoundryModel class implements the Windows Local Foundry API. """
+
+    def __init__(self, model_name=None, api_key=None, context_window=8192,
+                 max_output=1000, temperature=0.0, **kwargs):
+
+        super().__init__(**kwargs)
+
+        logger.info(f"WindowsLocalFoundryModel - constructing model - {model_name}")
+
+        self.model_class = "WindowsLocalFoundryModel"
+        self.model_category = "generative"
+        self.llm_response = None
+        self.usage = None
+        self.logits = None
+        self.output_tokens = None
+        self.final_prompt = None
+
+        # strip "-foundry" identifier
+        if model_name.endswith("-foundry"):
+            model_name = model_name[0:-len("-foundry")]
+
+        self.model_name = model_name
+
+        if api_key:
+            self.api_key = api_key
+
+        self.error_message = ("\nUnable to connect to WindowsLocalFoundry Model. "
+                              "Please try again later.")
+
+        self.separator = "\n"
+
+        # assume input (50%) + output (50%)
+        self.max_total_len = context_window
+        self.max_input_len = int(context_window * 0.5)
+        self.llm_max_output_len = int(context_window * 0.5)
+
+        # inference settings
+        if temperature >= 0.0:
+            self.temperature = temperature
+        else:
+            self.temperature = 0.0
+
+        self.target_requested_output_tokens = max_output
+        self.add_prompt_engineering = False
+        self.add_context = ""
+        self.prompt = ""
+        self.context = ""
+
+        self.instruction_following = False
+        self.prompt_wrapper = None
+
+        # provides option to pass custom openai_client to
+        # model class at inference time
+        self.openai_client = None
+
+        if "model_card" in kwargs:
+            self.model_card = kwargs["model_card"]
+        else:
+            self.model_card = {}
+
+        self.available = True
+
+        self.manager = None
+        self.base_url = ""
+        self.api_key = ""
+        self.model_id = ""
+
+        self.prepare_foundry_manager_and_model()
+
+        self.post_init()
+
+        logger.info(f"WindowsLocalFoundryModel - constructed successfully")
+
+    def prepare_foundry_manager_and_model(self):
+
+        """ Consolidates all init steps around the foundry manager and model """
+
+        foundry_handler = WindowsLocalFoundryHandler()
+
+        mgr = foundry_handler.get_manager()
+        list_loaded_models = mgr.list_loaded_models()
+
+        loaded_model = None
+
+        if list_loaded_models:
+            for model in list_loaded_models:
+                mgr.unload_model(model.id, force=True)
+
+                logger.info(f"prepare_foundry_manager_and_model - unloading model - {model.id}")
+
+                list_loaded_models = mgr.list_loaded_models()
+
+                logger.info(f"prepare_foundry_manager_and_model - "
+                            f"unloading model - {list_loaded_models}")
+
+        if loaded_model:
+            if loaded_model != self.model_name:
+                if mgr:
+                    foundry_handler.unload_model(loaded_model)
+
+        if mgr:
+            self.available = True
+            foundry_handler.start_server_if_needed()
+            confirmation = foundry_handler.download_if_needed(self.model_name)
+
+            mgr.load_model(self.model_name)
+
+            self.manager = mgr
+            self.base_url = self.manager.endpoint
+            self.api_key = self.manager.api_key
+            self.model_id = self.manager.get_model_info(self.model_name).id
+
+        return True
+
+    def prompt_engineer_chatgpt3(self, query, context, inference_dict=None):
+
+        """ Builds prompt in ChatGPT format.  """
+
+        if not self.add_prompt_engineering:
+            if context:
+                selected_prompt = "default_with_context"
+            else:
+                selected_prompt = "default_no_context"
+        else:
+            if context:
+                selected_prompt = "default_with_context"
+            else:
+                selected_prompt = "default_no_context"
+
+        prompt_dict = PromptCatalog().build_core_prompt(prompt_name=selected_prompt,
+                                                        separator=self.separator,
+                                                        query=query, context=context,
+                                                        inference_dict=inference_dict)
+
+        system_message = prompt_dict["prompt_card"]["system_message"]
+        if not system_message:
+            system_message = "You are a helpful assistant."
+
+        system_instruction = None
+        if inference_dict:
+            if "system_instruction" in inference_dict:
+                system_instruction = inference_dict["system_instruction"]
+        if not system_instruction:
+            system_instruction = system_message
+
+        core_prompt = prompt_dict["core_prompt"]
+
+        messages = [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": core_prompt}
+        ]
+
+        return messages
+
+    def prompt_engineer(self, query, context,inference_dict=None):
+
+        # unpack system instruction and chat history
+        messages = []
+
+        # this is the core message = context + query
+        if context:
+            output = context + "\n" + query
+        else:
+            output = query
+
+        chat_history = []
+        system_instruction = ""
+        if inference_dict:
+            if "chat_history" in inference_dict:
+                chat_history = inference_dict["chat_history"]
+            if "system_instruction" in inference_dict:
+                system_instruction = inference_dict["system_instruction"]
+
+        if not system_instruction:
+            system_instruction = "You are a helpful assistant."
+
+        # start with system message
+        messages.append({"role": "system", "content": system_instruction})
+
+        if chat_history:
+            for turn in chat_history:
+                messages.append({"role": "user", "content": turn["user"]})
+                messages.append({"role": "assistant",
+                                 "content": turn["assistant"]})
+
+        messages.append({"role": "user", "content": output})
+
+        return messages
+
+    def load_model_for_inference(self):
+
+        """ Check if model available, and if not load """
+
+        confirmation = WindowsLocalFoundryHandler().download_if_needed(self.model_name)
+
+        return True
+
+    def unload_model(self, model_name):
+
+        foundry_name = model_name
+
+        if model_name.endswith("-foundry"):
+            foundry_name = model_name[0:-len("-foundry")]
+
+        try:
+            from foundry_local import FoundryLocalManager
+            response = FoundryLocalManager().unload_model(foundry_name, force=True)
+            logger.info(f"WindowsLocalFoundryModel - "
+                        f"successful unload model")
+
+        except:
+            logger.info(f"WindowsLocalFoundryModel - unload not successful - "
+                        f"skipping")
+
+        return True
+
+    def close(self):
+
+        logger.info(f"WindowsLocalFoundryModel close model - {self.model_name}")
+
+        foundry_name = self.model_name
+
+        if self.model_name.endswith("-foundry"):
+            foundry_name = self.model_name[0:-len("-foundry")]
+
+        try:
+            response = self.manager.unload_model(foundry_name, force=True)
+            logger.info(f"WindowsLocalFoundryModel - "
+                        f"successful unload model")
+        except:
+            logger.info(f"WindowsLocalFoundryModel - unload not successful - "
+                        f"skipping")
+
+        return True
+
+    def inference(self, prompt, add_context=None, add_prompt_engineering=None, inference_dict=None,
+                  api_key=None):
+
+        """ Executes inference on OpenAI Model.  Only required input is text-based prompt, with optional
+        parameters to "add_context" passage that will be assembled using the prompt style in the
+        "add_prompt_engineering" parameter.  Optional inference_dict for temperature and max_tokens configuration,
+        and optional passing of api_key at time of inference. """
+
+        self.prompt = prompt
+
+        if add_context:
+            self.add_context = add_context
+
+        if add_prompt_engineering:
+            self.add_prompt_engineering = add_prompt_engineering
+
+        if inference_dict:
+
+            if "temperature" in inference_dict:
+                self.temperature = inference_dict["temperature"]
+
+            if "max_tokens" in inference_dict:
+                self.target_requested_output_tokens = inference_dict["max_tokens"]
+
+            if "openai_client" in inference_dict:
+                self.openai_client = inference_dict["openai_client"]
+
+        from llmware.configs import OpenAIConfig
+
+        #   call to preview hook (not implemented by default)
+        self.preview()
+
+        # start change here
+
+        prompt_enriched = self.prompt_engineer(prompt,add_context,
+                                               inference_dict=inference_dict)
+
+        # new - change with openai v1 api
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise DependencyNotInstalledException("openai >= 1.0")
+
+        usage = {}
+        time_start = time.time()
+
+        # Configure the client to use the local Foundry service
+        client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+
+        if self.model_name.endswith("-foundry"):
+            model_name = self.model_name[0:-(len("-foundry"))]
+        else:
+            model_name = self.model_name
+
+        # start here
+
+        # Set the model to use and generate a streaming response
+        stream = client.chat.completions.create(
+            model=self.model_id,
+            # messages=[{"role": "user", "content": prompt_enriched}],
+            messages=prompt_enriched,
+            stream=True,
+            max_tokens=self.target_requested_output_tokens
+        )
+
+        text_out = ""
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        # Print the streaming response
+        for chunk in stream:
+            if chunk.choices[0].delta.content is not None:
+                token = chunk.choices[0].delta.content or ""
+                # print(chunk.choices[0].delta.content, end="", flush=True)
+                text_out += token
+                # yield token
+
+        output_response = {"llm_response": text_out, "usage": usage}
+
+        # output inference parameters
+        self.llm_response = text_out
+        self.usage = usage
+        self.logits = None
+        self.output_tokens = None
+        self.final_prompt = prompt_enriched
+
+        self.register()
+
+        return output_response
+
+    def stream(self, prompt, add_context=None, add_prompt_engineering=None, inference_dict=None,
+                  api_key=None):
+
+        """ Executes stream inference on Windows Local Foundry Model with
+        OpenAI-compatible API.
+
+        Only required input is text-based prompt, with optional
+        parameters to "add_context" passage that will be assembled using the prompt style in the
+        "add_prompt_engineering" parameter.  Optional inference_dict for temperature and max_tokens configuration,
+        and optional passing of api_key at time of inference.
+        """
+
+        self.available = True
+
+        if not self.available:
+            logger.warning(f"WindowsLocalFoundryModel - could not connect to service - "
+                           f"unfortunately, model is not available.")
+
+            usage = {"input": 0, "output": 0, "total": 0, "metric": "tokens",
+                     "processing_time": 0.0}
+
+            output_response = {"llm_response": "Service Not Available",
+                               "usage": usage}
+
+            return output_response
+
+        self.prompt = prompt
+
+        if add_context:
+            self.add_context = add_context
+
+        if add_prompt_engineering:
+            self.add_prompt_engineering = add_prompt_engineering
+
+        if inference_dict:
+
+            if "temperature" in inference_dict:
+                self.temperature = inference_dict["temperature"]
+
+            if "max_tokens" in inference_dict:
+                self.target_requested_output_tokens = inference_dict["max_tokens"]
+
+            if "openai_client" in inference_dict:
+                self.openai_client = inference_dict["openai_client"]
+
+        from llmware.configs import OpenAIConfig
+
+        #   call to preview hook (not implemented by default)
+        self.preview()
+
+        # default case - pass the prompt received without change
+        # prompt_enriched = self.prompt
+
+        prompt_enriched = self.prompt_engineer(prompt,add_context,
+                                               inference_dict=inference_dict)
+
+        logger.info(f"WindowsLocalFoundryModel - stream - created prompt - "
+                    f"starting stream")
+
+        # new - change with openai v1 api
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise DependencyNotInstalledException("openai >= 1.0")
+
+        usage = {}
+        time_start = time.time()
+
+        # Configure the client to use the local Foundry service
+        client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+
+        # Set the model to use and generate a streaming response
+        stream = client.chat.completions.create(
+            model=self.model_id,
+            # messages=[{"role": "user", "content": prompt_enriched}],
+            messages=prompt_enriched,
+            stream=True,
+            max_tokens=self.target_requested_output_tokens
+        )
+
+        text_out = ""
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        # Print the streaming response
+        for chunk in stream:
+            if chunk.choices[0].delta.content is not None:
+                token = chunk.choices[0].delta.content or ""
+                # print(chunk.choices[0].delta.content, end="", flush=True)
+                text_out += token
+                yield token
+
+        usage = {"input": prompt_tokens,
+                 "output": completion_tokens,
+                 "total": prompt_tokens + completion_tokens,
+                 "metric": "tokens",
+                 "processing_time": time.time() - time_start}
+
+        output_response = {"llm_response": text_out, "usage": usage}
+
+        # output inference parameters
+        self.llm_response = text_out
+        self.usage = usage
+        self.logits = None
+        self.output_tokens = None
+        self.final_prompt = prompt_enriched
+
+        self.register()
+
+        return output_response
+
+
+class ONNXEmbeddingModel(BaseModel):
+
+    """ ONNXEmbeddingModel class implements support for onnxruntime reranking,
+    and classifier models. Despite the name, true batch 'embedding' method is
+    not yet implemented but is on roadmap.
+
+    This is intended to be a simple interface to use encoder-based models in ONNX,
+    especially for on-device use. """
+
+    def __init__(self, model=None, tokenizer=None, model_name=None, api_key=None,
+                 model_card=None, embedding_dims=None, max_len=None,
+                 device="CPU", **kwargs):
+
+        super().__init__(**kwargs)
+
+        self.model_class = "ONNXEmbeddingModel"
+        self.model_category = "embedding"
+        self.model_name = model_name
+        self.model = model
+        self.tokenizer = tokenizer
+        self.embedding_dims = embedding_dims
+        self.model_type = None
+        self.max_total_len = 512
+        self.model_architecture = None
+        self.model_card = model_card
+        self.safe_buffer = 12
+        self.device = device
+        self.context_window = 512
+
+        # main handler for model inference session
+        self.ort_session = None
+
+        if self.model_card:
+            if "embedding_dims" in self.model_card:
+                self.embedding_dims = self.model_card["embedding_dims"]
+
+            if "context_window" in self.model_card:
+                self.context_window = self.model_card["context_window"]
+
+        self.use_gpu = False
+        self.api_key = api_key
+
+        if self.context_window > self.safe_buffer:
+            self.max_len = self.context_window - self.safe_buffer
+        else:
+            self.max_len = self.context_window
+
+        if max_len:
+            if max_len:
+                if max_len < self.context_window:
+                    self.max_len = max_len
+
+        self.text_sample = None
+        self.model_folder_path = None
+
+        global GLOBAL_ONNX_CORE_RUNTIME
+
+        if not GLOBAL_ONNX_CORE_RUNTIME:
+
+            if util.find_spec("onnxruntime"):
+
+                # note: we import the pybind11 c++ wrapper interface directly
+
+                try:
+                    global ort
+                    ort = importlib.import_module("onnxruntime.capi.onnxruntime_pybind11_state")
+                    GLOBAL_ONNX_CORE_RUNTIME = True
+                except:
+                    raise LLMWareException(message="ONNXEmbeddingModel: could not load onnxruntime module. "
+                                                   "If you have pip installed the library, then please check "
+                                                   "that your platform is supported by onnxruntime.")
+
+            else:
+
+                raise LLMWareException(message="ONNXEmbeddingModel: need to import "
+                                               "onnxruntime to use this class, e.g., 'pip3 install "
+                                               "onnxruntime`")
+
+        # end dynamic import here
+
+        # self.post_init()
+
+    def load_model_for_inference(self, loading_directions, model_card=None):
+
+        """ Instantiates and loads model from local cache. """
+
+        if model_card:
+            self.model_card = model_card
+
+        # onnx expects a string path
+        self.model_folder_path = loading_directions
+
+        # instantiate the tokenizer from tokenizer.json file
+        # using hf tokenizers library
+        from tokenizers import Tokenizer
+        tokenizer_fn = "tokenizer.json"
+        self.tokenizer = Tokenizer.from_file(os.path.join(loading_directions, tokenizer_fn))
+
+        # currently hard-coded - adjust settings to increase size of text
+        self.tokenizer.enable_padding(length=150)
+        self.tokenizer.enable_truncation(150)
+
+        # currently hard-coded - load model.onnx file
+        model_fn = "model.onnx"
+        onnx_model_path = os.path.join(loading_directions, model_fn)
+
+        # create and initialize InferenceSession in onnxruntime
+        # -- calling methods directly in the pybind c++ .pyd file
+
+        session_options = ort.get_default_session_options()
+        self.ort_session = ort.InferenceSession(session_options, onnx_model_path, True, False)
+
+        # TODO: add more options and configs around providers and provider options
+        providers = []
+        provider_options = [dict()]
+        disabled_optimizers = set()
+
+        self.ort_session.initialize_session(providers, provider_options, disabled_optimizers)
+
+        # end - created and initialized onnxruntime session
+
+        return self
+
+    @staticmethod
+    def sigmoid(x):
+
+        """ Utility function to return sigmoid """
+
+        return 1.0 / (1.0 + np.exp(-x))
+
+    def rank(self, query, text_results, api_key=None, text_index="text",
+             top_n=20, relevance_threshold=None, min_return=3):
+
+        """ Executes reranking inference. """
+
+        #   call to preview (not implemented by default)
+        # self.preview()
+
+        batches = []
+        if len(text_results) <= 32:
+            # need to package in chunks
+            batches.append(text_results)
+        else:
+            batch_count = len(text_results) // 32
+            if len(text_results) > batch_count * 32:
+                batch_count += 1
+            for x in range(0, batch_count):
+                stopper = min(len(text_results), (x + 1) * 32)
+                new_batch = text_results[x * 32:stopper]
+                batches.append(new_batch)
+
+        output = []
+
+        for batch in batches:
+            documents = []
+            for i, chunks in enumerate(batch):
+                documents.append(chunks[text_index])
+
+            # runs the inference to get similarity score
+            scores = self.compute_score(query, documents)
+
+            if not isinstance(scores, list):
+                scores = [scores]
+
+            for i, score in enumerate(scores):
+                batch[i].update({"rerank_score": score})
+                output.append(batch[i])
+
+        ranked_output = sorted(output, key=lambda x: x["rerank_score"], reverse=True)
+
+        #   will return top_n if no relevance threshold set
+        if not relevance_threshold:
+            if top_n < len(ranked_output):
+                final_output = ranked_output[0:top_n]
+            else:
+                final_output = ranked_output
+        else:
+            final_output = []
+            #   if relevance threshold, will return all results above threshold
+            for entries in ranked_output:
+                if entries["rerank_score"] >= relevance_threshold:
+                    final_output.append(entries)
+
+            #   fallback, if no result above threshold, then will return the min number of results
+            if len(final_output) == 0:
+                final_output = ranked_output[0:min_return]
+
+        self.register()
+
+        return final_output
+
+    def compute_score(self, query, documents, batch_size: int = 32):
+
+        """ Runs the core ranking inference to determine semantic similarity -
+        called by rank method """
+
+        sentence_pairs = [[query, doc] for doc in documents]
+
+        if isinstance(sentence_pairs[0], str):
+            sentence_pairs = [sentence_pairs]
+
+        self.tokenizer.enable_truncation(100)
+        self.tokenizer.enable_padding(pad_token="<pad>")
+
+        all_scores = []
+        for start_index in range(0, len(sentence_pairs), batch_size):
+            sentence_batch = sentence_pairs[start_index: start_index + batch_size]
+
+            input_ids = []
+            attn_mask = []
+
+            tokenizer_output = self.tokenizer.encode_batch(sentence_batch)
+
+            for sequence in tokenizer_output:
+                input_ids.append(sequence.ids)
+                attn_mask.append(sequence.attention_mask)
+
+            input_ids = np.array(input_ids, dtype=np.int64)
+            attn_mask = np.array(attn_mask, dtype=np.int64)
+
+            # onnxruntime - run inference session
+
+            output_names = [output.name for output in self.ort_session.outputs_meta]
+
+            # replace None with output_names
+            run_options = None
+
+            output = self.ort_session.run(output_names, {"input_ids": input_ids,
+                                                         "attention_mask": attn_mask}, run_options)
+
+            # onnxruntime - end run inference session
+
+            scores = self.sigmoid(output[0])
+
+            if len(documents) == 1:
+                scores = [scores]
+            else:
+                score_float = []
+
+                # note: convert to 'float' -> safety for json conversion
+                for score in scores:
+                    if isinstance(score, np.ndarray):
+                        score_float.append(float(score[0]))
+                    else:
+                        score_float.append(float(score))
+
+                scores = score_float
+
+            all_scores.extend(scores)
+
+        return all_scores
+
+    def classify(self, text, **kwargs):
+
+        """ Executes a classifier inference with ONNX model """
+
+        config_path = os.path.join(self.model_folder_path, "config.json")
+        config = None
+
+        if os.path.exists:
+            try:
+                config = json.load(open(config_path, "r", errors="ignore"))
+            except:
+                logger.warning("onnx classifier config could not be loaded from file")
+                pass
+
+        if not config:
+            logger.warning("onnx classifier config - will not be able to convert outputs to keys - no config found.")
+
+        self.tokenizer.enable_truncation(300)
+        self.tokenizer.enable_padding(pad_token="<pad>")
+        tokenizer_output = self.tokenizer.encode(text)
+        input_ids = []
+        attn_mask = []
+
+        # for sequence in tokenizer_output:
+
+        input_ids.append(tokenizer_output.ids)
+        attn_mask.append(tokenizer_output.attention_mask)
+
+        input_ids = np.array(input_ids, dtype=np.int64)
+        attn_mask = np.array(attn_mask, dtype=np.int64)
+
+        # start here
+
+        output_names = [output.name for output in self.ort_session.outputs_meta]
+
+        # replace None with output_names
+        run_options = None
+
+        output = self.ort_session.run(output_names, {"input_ids": input_ids,
+                                                     "attention_mask": attn_mask}, run_options)
+
+        scores = self.sigmoid(output[0])
+
+        dict_scores = {}
+
+        if config:
+            dict_scores = [{"label": config["id2label"][str(i)],
+                            "score": score.item()} for i, score in enumerate(scores[0])]
+
+            dict_scores.sort(key=lambda x: x["score"], reverse=True)
+
+        self.register()
+
+        return dict_scores
+
+
+class ONNXVisionGenerativeModel(BaseModel):
+
+    """ONNXVisionGenerativeModel class implements the ONNX generative model API, with
+    integrated processor, to simplify multi-media processing. Currently this class
+    supports the phi-3-vision-onnx model by default, and images only.
+
+    Other multimedia types and additional model support - will be added over time. """
+
+    def __init__(self, model_name=None, api_key=None, model_card=None,
+                 prompt_wrapper=None, instruction_following=False, context_window=2048,
+                 use_gpu_if_available=True, trust_remote_code=True, sample=True, max_output=100, temperature=0.3,
+                 get_logits=False, api_endpoint=None, **kwargs):
+
+        super().__init__()
+
+        self.model_class = "ONNXVisionGenerativeModel"
+        self.model_category = "generative"
+        self.llm_response = None
+        self.usage = None
+        self.logits = None
+        self.output_tokens = None
+        self.final_prompt = None
+        self.model_name = model_name
+        self.hf_tokenizer_name = model_name
+        self.model = None
+        self.tokenizer = None
+        self.generator = None
+        self.sample = sample
+        self.get_logits = get_logits
+        self.auto_remediate_function_call_output = True
+        self.model_card = model_card
+        self.logits_record = []
+        self.output_tokens = []
+        self.top_logit_count = 10
+        self.primary_keys = None
+        self.function = None
+        self.fc_supported = False
+        self.tool_type = None
+
+        if model_card:
+
+            if "primary_keys" in model_card:
+                self.primary_keys = model_card["primary_keys"]
+
+            if "function" in model_card:
+                self.function = model_card["function"]
+
+            if "function_call" in model_card:
+                self.fc_supported = model_card["function_call"]
+
+        # instantiate if model_name passed without actual model and tokenizer
+        if model_name and not api_endpoint:
+
+            if not self.model_card:
+                self.model_card = ModelCatalog().lookup_model_card(self.model_name)
+
+            if self.model_card:
+                if "hf_repo" in self.model_card:
+                    hf_repo_name = self.model_card["hf_repo"]
+                    self.hf_tokenizer_name = hf_repo_name
+
+            self.model = None
+            self.tokenizer = None
+            self.tokenizer_stream = None
+
+            # set to defaults for HF models in Model Catalog
+            # this can be over-ridden post initiation if needed for custom models
+            self.prompt_wrapper = "phi_3_vision"
+            self.instruction_following = False
+
+        # insert dynamic onnx load here
+
+        global GLOBAL_ONNX_GENAI_RUNTIME
+
+        if not GLOBAL_ONNX_GENAI_RUNTIME:
+
+            if util.find_spec("onnxruntime_genai"):
+
+                try:
+                    global og
+                    og = importlib.import_module("onnxruntime_genai")
+                    GLOBAL_ONNX_GENAI_RUNTIME = True
+                except:
+                    raise LLMWareException(message="ONNXVisionGenerativeModel: could not load onnxruntime_genai module. "
+                                                   "If you have pip installed the library, then please check "
+                                                   "that your platform is supported by onnxruntime.")
+
+            else:
+                import platform
+                if platform.system() == "Darwin":
+                    raise LLMWareException(message=f"ONNXVisionGenerativeModel: identified current platform as 'Mac OS' "
+                                                   f"which is not supported for onnxruntime_genai currently. "
+                                                   f"\nWe would recommend using GGUF for generative inference on a "
+                                                   f"Mac, or if you wish to use ONNXGenerativeModel, then please "
+                                                   f"shift to a supported Windows or Linux platform.")
+
+                raise LLMWareException(message="ONNXVisionGenerativeModel: need to import "
+                                               "onnxruntime_genai to use this class, e.g., 'pip3 install "
+                                               "onnxruntime_genai`")
+
+        # end dynamic import here
+
+        self.params = None
+
+        self.prompt_wrapper = "phi_3_vision"
+
+        if not model_card:
+            # safety - empty iterable rather than 'None'
+            model_card = []
+
+        # deprecated attribute - will be removed in future releases
+        if "instruction_following" in model_card:
+            self.instruction_following = model_card["instruction_following"]
+        else:
+            self.instruction_following = False
+
+        if "prompt_wrapper" in model_card:
+            self.prompt_wrapper = model_card["prompt_wrapper"]
+
+        self.trailing_space = ""
+
+        if "trailing_space" in model_card:
+            self.trailing_space = model_card["trailing_space"]
+
+        self.model_type = None
+        self.config = None
+
+        # parameters on context len + output generation
+        self.max_total_len = context_window
+        self.max_input_len = int(0.5 * context_window)
+        self.llm_max_output_len = int(0.5 * context_window)
+
+        # key output parameters
+        self.max_output = max_output
+        self.target_requested_output_tokens = self.max_output
+
+        self.model_architecture = None
+        self.separator = "\n"
+
+        # use 0 as eos token id by default in generation -> but try to pull from model config
+        self.eos_token_id = 0
+
+        self.use_gpu = False
+
+        # no api key expected or required
+        self.api_key = api_key
+
+        self.error_message = "\nUnable to identify and load HuggingFace model."
+
+        # if temperature set at time of loading the model, then use that setting
+        if temperature != -99:
+            self.temperature = temperature
+        elif "temperature" in model_card:
+            # if not set, then pull the default temperature from the model card
+            self.temperature = model_card["temperature"]
+        else:
+            # if no guidance from model loading or model card, then set at default of 0.0
+            self.temperature = 0.0
+
+        self.add_prompt_engineering = False
+        self.add_context = ""
+        self.context = ""
+        self.prompt = ""
+
+        self.api_endpoint = api_endpoint
+
+        self.model_repo_path = None
+        self.model = None
+        self.processor = None
+        self.tokenizer_stream = None
+
+        # self.post_init()
+
+    def load_model_for_inference(self, loading_directions, model_card=None):
+
+        """ Loads ONNX Model from local path using loading directions. """
+
+        self.model_repo_path = loading_directions
+
+        if model_card:
+            self.model_card = model_card
+
+        self.model = og.Model(loading_directions)
+
+        logger.info("ONNXVisionGenerative Model - constructing model completed.")
+
+        try:
+            self.processor = self.model.create_multimodal_processor()
+        except Exception as e:
+            logger.warning(f"ONNXVisionGenerativeModel - failed to create multimodal "
+                           f"processor with error code: {e}")
+            return self
+
+        self.tokenizer_stream = self.processor.create_stream()
+
+        return self
+
+    def unload_model(self):
+        """ Not implemented. """
+        return True
+
+    def set_api_key(self, api_key, env_var=""):
+        """ Not implemented for this model class """
+        return True
+
+    def _get_api_key(self, env_var=""):
+        """ Not implemented for this model class """
+        return True
+
+    def inference(self, text_prompt, image_path, **kwargs):
+
+        """ Vision inference expects two inputs -
+            -- text_prompt: instruction, e.g., 'describe this image'
+            -- image_path: full file path to supported image type (e.g., jpg, png)
+        """
+
+        t0 = time.time()
+
+        if not self.processor:
+            logger.warning(f"ONNXVisionGenerativeModel - processor not created")
+            return ""
+
+        image_path = [image_path]
+
+        images = og.Images.open(*image_path)
+
+        # example prompt, e.g., phi-3-vision
+        # prompt = "<|user|>\n" + "<|image_1|>\n" + text_prompt + "<|end|>\n<|assistant|>\n"
+
+        prompt = PromptCatalog().apply_prompt_wrapper(text_prompt,self.prompt_wrapper)
+
+        try:
+            inputs = self.processor(prompt, images=images)
+        except Exception as e:
+            logger.info(f"ONNXVisionGenerativeModel - processor not successful - "
+                        f"generated run time error - {e}")
+            inputs = []
+
+        logging.info("ONNXVisionGenerative Model - Generating response.")
+
+        params = og.GeneratorParams(self.model)
+        max_tokens = 7680
+        params.set_search_options(max_length=max_tokens)
+        generator = og.Generator(self.model, params)
+        generator.set_inputs(inputs)
+        token_count = 0
+        output_text = ""
+
+        while not generator.is_done():
+
+            generator.generate_next_token()
+
+            new_token = generator.get_next_tokens()[0]
+            new_token_dec = self.tokenizer_stream.decode(new_token)
+            output_text += new_token_dec
+
+            token_count += 1
+            if token_count > max_tokens:
+                break
+
+        logging.info(f"\nONNXVisionGenerativeModel - tokens generated: {token_count}")
+        logging.info(f"\nONNXVisionGenerative Model - processing time: {time.time()-t0}")
+
+        t1 = time.time()
+
+        # todo: will add separate counting of input tokens
+        input_token_count = 0
+
+        response = {"llm_response": output_text,
+                    "usage": {"input": input_token_count,
+                              "output": token_count,
+                              "total": input_token_count +token_count,
+                              "metric": "tokens",
+                              "processing_time": t1-t0}}
+
+        return response
+
+    def stream(self, text_prompt, image_path, **kwargs):
+
+        """ Vision stream inference expects two inputs -
+                    -- text_prompt: instruction, e.g., 'describe this image'
+                    -- image_path: full file path to supported image type (e.g., jpg, png)
+
+        note: initial image encoding can easily take 10-20 seconds, depending upon system,
+        and then stream generation output is rapid after that.
+
+        """
+
+        t0 = time.time()
+
+        if not self.processor:
+            logger.warning(f"ONNXVisionGenerativeModel - processor not created")
+            return ""
+
+        image_path = [image_path]
+
+        images = og.Images.open(*image_path)
+
+        # e.g., prompt for phi-3-vision currently
+        # prompt = "<|user|>\n" + "<|image_1|>\n" + text_prompt + "<|end|>\n<|assistant|>\n"
+
+        prompt = PromptCatalog().apply_prompt_wrapper(text_prompt, self.prompt_wrapper)
+
+        try:
+            inputs = self.processor(prompt, images=images)
+        except Exception as e:
+            logger.info(f"ONNXVisionGenerativeModel - processor not successful - "
+                        f"generated run time error - {e}")
+            inputs = []
+
+        logging.info("ONNXVisionGenerative Model - Generating response.")
+
+        params = og.GeneratorParams(self.model)
+        max_tokens = 7680
+        params.set_search_options(max_length=max_tokens)
+        generator = og.Generator(self.model, params)
+        generator.set_inputs(inputs)
+        token_count = 0
+        output_text = ""
+
+        while not generator.is_done():
+
+            generator.generate_next_token()
+
+            new_token = generator.get_next_tokens()[0]
+            new_token_dec = self.tokenizer_stream.decode(new_token)
+            output_text += new_token_dec
+
+            token_count += 1
+            if token_count > max_tokens:
+                break
+
+            yield new_token_dec
+
+        logging.info(f"\nONNXVisionGenerativeModel - tokens generated: {token_count}")
+        logging.info(f"\nONNXVisionGenerative Model - processing time: {time.time()-t0}")
+
+        self.register()
+
+        return output_text
+
+    def cleanup_stream_gen_on_early_stop(self):
+        self.generator = None
+        return True
+
+    def register_top_logits(self, logit):
+
+        """ Gets the top logits and keeps a running log for output analysis. """
+
+        # logit will be in form of (1,1,vocab_len), for all but the first logit
+        # if first logit (will have shape of context len - add [-1])
+
+        if logit.shape[1] > 1:
+            # used for first logit with shape, e.g., (1,input_token_len,vocab_size)
+            logit_array = logit.squeeze()[-1]
+        else:
+            # all other logits after the first token
+            logit_array = logit.squeeze()
+
+        logit_size = logit.shape[-1]
+
+        # useful check on shape of logit_array
+        logit_array_size = logit_array.shape
+
+        sm = np.exp(logit_array) / sum(np.exp(logit_array))
+
+        sm_sorted = np.sort(sm)
+        sm_args_sorted = np.argsort(sm)
+
+        top_logits = []
+
+        for x in range(0, self.top_logit_count):
+            # round the float number to 3 digits
+            pair = (sm_args_sorted[logit_size - x - 1], round(sm_sorted[logit_size - x - 1], 3))
+            top_logits.append(pair)
+
+        self.logits_record.append(top_logits)
+
+        return top_logits
+
+
+class _OVInfer:
+
+    """ Wrapper to package inputs and outputs in connection with executing a
+    forward pass on OpenVINO model (e.g., infer_request) - derived closely from
+    utilities provided in OpenVINO, e.g.:
+
+    https://github.com/openvinotoolkit/openvino/blob/master/src/bindings/python/src/openvino/utils/data_helpers/data_dispatcher.py
+
+    Not intended to be called directly, but is used as utility within other
+    OV model classes.
+    """
+
+    def __init__(self, _infer_request=None):
+        self._infer_request = _infer_request
+
+    def ov_core_inference(self, inputs,
+                          _infer_request,
+                          share_outputs=False,
+                          decode_strings=True):
+
+        """ Primary entrypoint into _OVInfer - takes the 'raw' inputs and
+        infer_request instance, and wraps both the inputs, calls the
+        forward pass on the infer request, and then wraps the outputs. """
+
+        self._infer_request = _infer_request
+
+        if inputs is None:
+            inputs = {}
+
+        # by default
+        is_shared = True
+
+        # prepare model inputs
+        if is_shared:
+            model_inputs = self._create_shared(inputs, _infer_request)
+        else:
+            model_inputs = self._create_copied(inputs, _infer_request)
+
+        # run inference
+        response = _infer_request.infer(model_inputs,
+                                        share_outputs=share_outputs,
+                                        decode_strings=decode_strings)
+
+        # package up response
+        ov_dict = OVDict(response)
+
+        return ov_dict
+
+    def _create_shared(self, inputs, request):
+
+        if isinstance(inputs, dict) or isinstance(inputs, tuple) or isinstance(inputs, OVDict):
+            inp_n = self.normalize_arrays(inputs, is_shared=True)
+            return {k: self.value_to_tensor(v, request=request, is_shared=True, key=k) for k, v in inp_n.items()}
+
+        elif isinstance(inputs, list):
+            if len(request.input_tensors) == 1:
+                is_single_input = True
+            else:
+                is_single_input = False
+
+            inputs_x = self.normalize_arrays(
+                [inputs] if is_single_input and self.is_list_simple_type(inputs) else inputs, is_shared=True)
+
+            return {k: self.value_to_tensor(v, request=request, is_shared=True, key=k) for k, v in inputs_x.items()}
+
+        elif isinstance(inputs, np.ndarray):
+            inp = self.normalize_arrays(inputs, is_shared=True)
+            return self.value_to_tensor(inp, request=request, is_shared=True)
+
+        elif isinstance(inputs, int) or isinstance(inputs, float) or isinstance(inputs, str) \
+                or isinstance(inputs, bytes) or isinstance(inputs, ovc.Tensor) or isinstance(inputs, np.number):
+            return self.value_to_tensor(inputs, request=request, is_shared=True)
+
+        # Check the special case of the array-interface
+        if hasattr(inputs, "__array__"):
+            request._inputs_data = self.normalize_arrays(inputs, is_shared=True)
+            return self.value_to_tensor(request._inputs_data, request=request, is_shared=True)
+
+        # raise error if incompatible type
+        raise LLMWareException(message=f"_OVInfer - _created_share - "
+                                       f"incompatible inputs of type: {type(inputs)}")
+
+    def _create_copied(self, inputs, request):
+
+        if isinstance(inputs, dict) or isinstance(inputs, tuple) or isinstance(OVDict):
+            return self.update_inputs(self.normalize_arrays(inputs, is_shared=False), request)
+
+        elif isinstance(inputs, list):
+            return self.update_inputs(
+                self.normalize_arrays([inputs] if request._is_single_input() and self.is_list_simple_type(inputs) else inputs,
+                                 is_shared=False), request)
+
+        elif isinstance(inputs, np.ndarray):
+            self.update_tensor(self.normalize_arrays(inputs, is_shared=False), request, key=None)
+            return {}
+
+        elif isinstance(inputs, ovc.Tensor) or isinstance(inputs, np.number) or isinstance(inputs, int) or \
+                isinstance(inputs, float) or isinstance(inputs, str) or isinstance(inputs, bytes):
+            return self.value_to_tensor(inputs, request=request, is_shared=False)
+
+        # Check the special case of the array-interface
+        if hasattr(inputs, "__array__"):
+            self.update_tensor(self.normalize_arrays(inputs, is_shared=False), request, key=None)
+            return {}
+
+        # raise error if incompatible type
+        raise LLMWareException(message=f"_OVInfer - _created_copied - "
+                                       f"incompatible inputs of type: {type(inputs)}")
+
+    def get_request_tensor(self, request, key=None):
+
+        """ Retrieves the input tensor from a request instance. """
+
+        if key is None:
+            return request.get_input_tensor()
+        elif isinstance(key, int):
+            return request.get_input_tensor(key)
+        elif isinstance(key, (str, ovc.ConstOutput)):
+            return request.get_tensor(key)
+        else:
+            raise LLMWareException(message=f"_OVInfer - get_request_tensor - "
+                                           f"key type {type(key)} is not "
+                                           f"supported for Tensor key: {key}")
+
+    def value_to_tensor(self, value, request=None, is_shared: bool = False, key=None) -> None:
+
+        """ Converts value to OV tensor """
+
+        if isinstance(value, ovc.Tensor):
+            return value
+
+        elif isinstance(value, np.ndarray):
+            tensor = self.get_request_tensor(request, key)
+            tensor_type = tensor.get_element_type()
+            tensor_dtype = tensor_type.to_dtype()
+            # String edge-case, always copy.
+            # Scalars are also handled by C++.
+            if tensor_type == ovc.Type.string:
+                return ovc.Tensor(value, shared_memory=False)
+            # Scalars edge-case:
+            if value.ndim == 0:
+                tensor_shape = tuple(tensor.shape)
+                if tensor_dtype == value.dtype and tensor_shape == value.shape:
+                    return ovc.Tensor(value, shared_memory=is_shared)
+                elif tensor.size == 0:
+                    # the first infer request for dynamic input cannot reshape to 0 shape
+                    return ovc.Tensor(value.astype(tensor_dtype).reshape((1)), shared_memory=False)
+                else:
+                    return ovc.Tensor(value.astype(tensor_dtype).reshape(tensor_shape), shared_memory=False)
+            # WA for FP16-->BF16 edge-case, always copy.
+            if tensor_type == ovc.Type.bf16:
+                tensor = ovc.Tensor(tensor_type, value.shape)
+                tensor.data[:] = value.view(tensor_dtype)
+                return tensor
+
+            # WA for "not writeable" edge-case, always copy.
+            if value.flags["WRITEABLE"] is False:
+                tensor = ovc.Tensor(tensor_type, value.shape)
+                tensor.data[:] = value.astype(tensor_dtype) if tensor_dtype != value.dtype else value
+                return tensor
+            # If types are mismatched, convert and always copy.
+            if tensor_dtype != value.dtype:
+                return ovc.Tensor(value.astype(tensor_dtype), shared_memory=False)
+            # Otherwise, use mode defined in the call.
+            return ovc.Tensor(value, shared_memory=is_shared)
+
+        elif isinstance(value, list):
+            return ovc.Tensor(value)
+
+        elif isinstance(value, int) or isinstance(value, float) or isinstance(value, str) or \
+                isinstance(value, bytes) or isinstance(value, np.number):
+            # np.number/int/float/str/bytes edge-case, copy will occur in both scenarios.
+            tensor_type = self.get_request_tensor(request, key).get_element_type()
+            tensor_dtype = tensor_type.to_dtype()
+            tmp = np.array(value)
+            # String edge-case -- it converts the data inside of Tensor class.
+            # If types are mismatched, convert.
+            if tensor_type != ovc.Type.string and tensor_dtype != tmp.dtype:
+                return ovc.Tensor(tmp.astype(tensor_dtype), shared_memory=False)
+            return ovc.Tensor(tmp, shared_memory=False)
+
+        # raise error if incompatible type
+        raise LLMWareException(message=f"_OVInfer - value_to_tensor - "
+                                       f"incompatible inputs of type: {type(value)}")
+
+    def to_c_style(self, value: Any, is_shared: bool = False) -> Any:
+
+        if not isinstance(value, np.ndarray):
+            if hasattr(value, "__array__"):
+                return self.to_c_style(np.array(value, copy=False), is_shared) if is_shared else np.array(value, copy=True)
+            return value
+        return value if value.flags["C_CONTIGUOUS"] else np.ascontiguousarray(value)
+
+    def normalize_arrays(self, inputs: Any, is_shared: bool = False) -> Any:
+
+        if isinstance(inputs, dict):
+            return {k: self.to_c_style(v, is_shared) if is_shared else v for k, v in inputs.items()}
+
+        if isinstance(inputs, OVDict):
+            return {i: self.to_c_style(v, is_shared) if is_shared else v for i, (_, v) in enumerate(inputs.items())}
+
+        if isinstance(inputs, list) or isinstance(inputs, tuple):
+            return {i: self.to_c_style(v, is_shared) if is_shared else v for i, v in enumerate(inputs)}
+
+        if isinstance(inputs, np.ndarray):
+            return self.to_c_style(inputs, is_shared) if is_shared else inputs
+
+        # Check the special case of the array-interface
+        if hasattr(inputs, "__array__"):
+            return self.to_c_style(np.array(inputs, copy=False), is_shared) if is_shared else np.array(inputs, copy=True)
+
+        # raise error if incompatible type
+        raise LLMWareException(message=f"_OVInfer - normalize_arrays - "
+                                       f"incompatible inputs of type: {type(inputs)}")
+
+    def set_request_tensor(self, request, tensor, key=None) -> None:
+
+        if key is None:
+            request.set_input_tensor(tensor)
+        elif isinstance(key, int):
+            request.set_input_tensor(key, tensor)
+        elif isinstance(key, (str, ovc.ConstOutput)):
+            request.set_tensor(key, tensor)
+        else:
+            # raise error if incompatible type
+            raise LLMWareException(message=f"_OVInfer - set_request_tensor - "
+                                           f"unsupported key type: {type(key)} for "
+                                           f"tensor under key: {key}")
+
+    def update_tensor(self, inputs: Any, request, key=None) -> None:
+
+        if isinstance(inputs, np.ndarray):
+            if inputs.ndim != 0:
+                tensor = self.get_request_tensor(request, key)
+                # Update shape if there is a mismatch
+                if tuple(tensor.shape) != inputs.shape:
+                    tensor.shape = inputs.shape
+                # When copying, type should be up/down-casted automatically.
+                if tensor.element_type == ovc.Type.string:
+                    tensor.bytes_data = inputs
+                else:
+                    tensor.data[:] = inputs[:]
+            else:
+                # If shape is "empty", assume this is a scalar value
+                self.set_request_tensor(
+                    request,
+                    self.value_to_tensor(inputs, request=request, is_shared=False, key=key),
+                    key,
+                )
+
+            # TODO: what to return
+
+        elif isinstance(inputs, np.number) or isinstance(inputs, float) or isinstance(inputs, int) or \
+                isinstance(inputs, str):
+            self.set_request_tensor(
+                request,
+                self.value_to_tensor(inputs, request=request, is_shared=False, key=key),
+                key,
+            )
+
+        if hasattr(inputs, "__array__"):
+            self.update_tensor(self.normalize_arrays(inputs, is_shared=False), request, key)
+            return None
+
+        # raise error if unsupported key type
+        raise LLMWareException(message=f"_OVInfer - update_tensor - "
+                                       f"unsupported key type: {type(inputs)} for "
+                                       f"tensor under key: {key}")
+
+    def update_inputs(self, inputs: dict, request):
+
+        # Create new temporary dictionary.
+        # new_inputs will be used to transfer data to inference calls,
+        # ensuring that original inputs are not overwritten with Tensors.
+        new_inputs = {}
+
+        for key, value in inputs.items():
+            if not isinstance(key, (str, int, ovc.ConstOutput)):
+                raise TypeError(f"Incompatible key type for input: {key}")
+            # Copy numpy arrays to already allocated Tensors.
+            # If value object has __array__ attribute, load it to Tensor using np.array
+            if isinstance(value, (np.ndarray, np.number, int, float, str)) or hasattr(value, "__array__"):
+                self.update_tensor(value, request, key)
+            elif isinstance(value, list):
+                new_inputs[key] = ovc.Tensor(value)
+            # If value is of Tensor type, put it into temporary dictionary.
+            elif isinstance(value, ovc.Tensor):
+                new_inputs[key] = value
+            # Throw error otherwise.
+            else:
+
+                # raise error if unsupported type
+                raise LLMWareException(message=f"_OVInfer - update_inputs - "
+                                               f"unsupported key type: {type(value)} for "
+                                               f"tensor under key: {key}")
+
+        return new_inputs
+
+    def is_list_simple_type(self, input_list: list) -> bool:
+
+        for sublist in input_list:
+            if isinstance(sublist, list):
+                for element in sublist:
+                    if not isinstance(element, (str, float, int, bytes)):
+                        return False
+            else:
+                if not isinstance(sublist, (str, float, int, bytes)):
+                    return False
+        return True
+
+
+class OVDict(Mapping):
+
+    """ Output handler for OV infer request forward pass, used for
+    downstream processing in OVEmbeddingModel class - mirrors
+    OpenVINO OVDict definition. """
+
+    def __init__(self, _dict):
+        self._dict = _dict
+        self._names = None
+
+    def __iter__(self):
+        return self._dict.__iter__()
+
+    def __len__(self) -> int:
+        return len(self._dict)
+
+    def __repr__(self) -> str:
+        return self._dict.__repr__()
+
+    def __get_names(self):
+        return {key: key.get_names() for key in self._dict.keys()}
+
+    def __get_key(self, index: int):
+        return list(self._dict.keys())[index]
+
+    def __getitem__(self, key) -> np.ndarray:
+
+        if isinstance(key, str):
+            if self._names is None:
+                self._names = self.__get_names()
+            for port, port_names in self._names.items():
+                if key in port_names:
+                    return self._dict[port]
+            raise KeyError(key)
+
+        elif isinstance(key, int):
+            try:
+                return self._dict[self.__get_key(key)]
+            except IndexError:
+                raise KeyError(key)
+        else:
+            try:
+                return self._dict[key]
+            except:
+                raise LLMWareException(message=f"OVDict - unknown key type - {type(key)}")
+
+    def keys(self):
+        return self._dict.keys()
+
+    def values(self):
+        return self._dict.values()
+
+    def items(self):
+        return self._dict.items()
+
+    def names(self):
+
+        if self._names is None:
+            self._names = self.__get_names()
+        return tuple(self._names.values())
+
+    def to_dict(self):
+        return self._dict
+
+    def to_tuple(self):
+        return tuple(self._dict.values())
+
+
+class OVEmbeddingModel(BaseModel):
+
+    """ OVEmbeddingModel class implements a high-level interface to use
+    OpenVINO encoder-based models, supporting three different modalities currently:
+
+        -- Embedding - for use with vector databases
+        -- Reranker  - for in-memory semantic similarity comparisons
+        -- Classify  - for classifier based models
+
+    """
+
+    def __init__(self, model=None, tokenizer=None, model_name=None, api_key=None, model_card=None,
+                 embedding_dims=None, use_gpu_if_available=True, max_len=None, device="CPU", **kwargs):
+
+        super().__init__(**kwargs)
+
+        self.model_class = "OVEmbeddingModel"
+        self.model_category = "embedding"
+
+        self.model_name = model_name
+        self.model = model
+        self.tokenizer= tokenizer
+        self.embedding_dims = embedding_dims
+        self.model_type = None
+        self.max_total_len = 512
+        self.model_architecture = None
+        self.model_card = model_card
+        self.safe_buffer = 12
+        self.device = device
+
+        # default for HF embedding model -> will be over-ridden by model card / configs, if available
+        self.context_window = 512
+
+        if self.model_card:
+            if "embedding_dims" in self.model_card:
+                self.embedding_dims = self.model_card["embedding_dims"]
+
+            if "context_window" in self.model_card:
+                self.context_window = self.model_card["context_window"]
+
+            if "model_name" in self.model_card:
+                self.model_name = self.model_card["model_name"]
+
+        global ovc
+        global GLOBAL_OPENVINO_IMPORT
+        if not GLOBAL_OPENVINO_IMPORT:
+
+            if not util.find_spec("openvino"):
+                raise LLMWareException(message="OVEmbeddingModel: to use OVEmbeddingModel requires "
+                                               "install of 'openvino' library.  "
+                                               "Please try: `pip3 install openvino` "
+                                               "and confirm that your "
+                                               "hardware platform is supported.")
+
+            if util.find_spec("openvino"):
+
+                # loads/accesses the openvino pybind pyd methods directly
+
+                try:
+                    ovc = importlib.import_module("openvino._pyopenvino")
+                    GLOBAL_OPENVINO_IMPORT = True
+                except:
+                    raise LLMWareException(message="OVEmbeddingModel: could not load openvino module.")
+
+            if not ovc:
+                raise LLMWareException(message="OVEmbeddingModel: could not load required openvino dependency.")
+
+        # end dynamic import here
+
+        self.use_gpu = False
+
+        # no api key expected or required
+        self.api_key = api_key
+
+        # set max len for tokenizer truncation with 'safe_buffer' below context_window size
+        if self.context_window > self.safe_buffer:
+            self.max_len = self.context_window - self.safe_buffer
+        else:
+            self.max_len = self.context_window
+
+        # option to set smaller size than model context window
+        if max_len:
+            if max_len < self.context_window:
+                self.max_len = max_len
+
+        self.text_sample = None
+
+        self.model_folder_path = None
+        self._device = self.device
+        self.is_dynamic = True
+        self.read_model_xml_path = None
+        self.model = None
+        self.request = None
+        self._infer_request = None
+        self.input_names = None
+        self.output_names = None
+        self.config = None
+
+        # post init not implemented for this model class currently
+        # self.post_init()
+
+    def load_model_for_inference(self, loading_directions, model_card=None):
+
+        """ Loads OV Embedding Model from local path using loading directions. """
+
+        if model_card:
+            self.model_card = model_card
+
+        self.model_folder_path = Path(loading_directions)
+
+        # load the tokenizer from tokenizer.json in model repo
+        from tokenizers import Tokenizer
+
+        tokenizer_fn = "tokenizer.json"
+        self.tokenizer = Tokenizer.from_file(os.path.join(loading_directions, tokenizer_fn))
+
+        # hard-coded at 150 tokens -> adjust to increase/decrease
+        self.tokenizer.enable_padding(length=150)
+        self.tokenizer.enable_truncation(150)
+
+        if not ovc:
+            logger.warning("OVEmbeddingModel - could not find backend module")
+            return False
+
+        #   need to get config.json file
+        self.config = self.get_config_from_file()
+
+        self.read_model_xml_path = Path(os.path.join(loading_directions, "openvino_model.xml"))
+
+        core = ovc.Core()
+        self.model = core.read_model(self.read_model_xml_path.resolve(),
+                                     self.read_model_xml_path.with_suffix(".bin").resolve())
+
+        if self.is_dynamic:
+            height = None
+            width = None
+            self.model = self._reshape(self.model, -1, -1, height, width)
+
+        input_names = {}
+        for idx, key in enumerate(self.model.inputs):
+            names = tuple(key.get_names())
+            input_names[next((name for name in names if "/" not in name), names[0])] = idx
+        self.input_names = input_names
+
+        output_names = {}
+        for idx, key in enumerate(self.model.outputs):
+            names = tuple(key.get_names())
+            output_names[next((name for name in names if "/" not in name), names[0])] = idx
+        self.output_names = output_names
+
+        self.request = None
+
+        if self.request is None:
+
+            # try to load on GPU first, and fallback to CPU, if GPU fails
+
+            try:
+                gpu_device_name = core.get_property("GPU", "FULL_DEVICE_NAME")
+                logger.info(f"OVGenerativeModel - found gpu device - name: {gpu_device_name}.")
+                device = "GPU"
+                logger.info(f"OVEmbeddingModel - successful finding GPU")
+
+            except:
+                logger.debug("OVGenerativeModel - loading - could not find gpu - setting device for CPU")
+                device = "CPU"
+
+            self._device = device
+            logger.info(f"OVEmbeddingModel - device - {device}")
+
+            ov_config = {}
+            self.request = core.compile_model(self.model, self._device, ov_config)
+
+        logger.info(f"OVEmbedding - completed model compile - {self.model_name} "
+                    f"on device - {self._device}")
+
+        return self
+
+    def get_config_from_file(self):
+
+        """ Loads config information from config.json file """
+
+        config_file = os.path.join(self.model_folder_path, "config.json")
+
+        try:
+            config = json.load(open(config_file, "r"))
+        except:
+            config = {}
+
+        return config
+
+    def _inference(self, inputs):
+
+        """ Internal inference method implements forward pass on the model """
+
+        if not self._infer_request:
+            self._infer_request = self.request.create_infer_request()
+
+        try:
+            outputs = _OVInfer().ov_core_inference(inputs,
+                                               self._infer_request,
+                                               share_outputs=False,
+                                               decode_strings=True)
+
+        except Exception as e:
+            raise LLMWareException(message=f"OVEmbeddingModel - _inference - "
+                                           f"unsuccessful - generated error code - "
+                                           f"{e}")
+
+        return outputs
+
+    def set_api_key(self, api_key, env_var=""):
+        """ Not implemented """
+        return True
+
+    def _get_api_key(self, env_var=""):
+        """ Not implemented """
+        return True
+
+    def token_counter(self, text_sample):
+
+        """ Counts tokens in text sample. """
+
+        toks = self.tokenizer.encode(text_sample).ids
+        return len(toks)
+
+    @staticmethod
+    def sigmoid(x):
+        """Simple sigmoid function. Not numerically stable!"""
+        return 1.0 / (1.0 + np.exp(-x))
+
+    def _reshape(self, model, batch_size, sequence_length, height=None, width=None):
+
+        """ Internal implementation method to reshape the input """
+
+        shapes = {}
+        for inputs in model.inputs:
+            shapes[inputs] = inputs.get_partial_shape()
+            shapes[inputs][0] = batch_size
+            shapes[inputs][1] = sequence_length
+            if height is not None:
+                shapes[inputs][2] = height
+            if width is not None:
+                shapes[inputs][3] = width
+        model.reshape(shapes)
+        return model
+
+    def reshape(self, batch_size, sequence_length, height=None, width= None):
+
+        """ Reshape input """
+
+        self.is_dynamic = True if batch_size == -1 and sequence_length == -1 else False
+        self.model = self._reshape(self.model, batch_size, sequence_length, height, width)
+        self.request = None
+        return self
+
+    def forward(self, input_ids, attention_mask, token_type_ids = None, **kwargs):
+
+        """ Forward pass on model """
+
+        np_inputs = isinstance(input_ids, np.ndarray)
+        if not np_inputs:
+            input_ids = np.array(input_ids)
+            attention_mask = np.array(attention_mask)
+            token_type_ids = np.array(token_type_ids) if token_type_ids is not None else token_type_ids
+
+        inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+
+        # Add the token_type_ids when needed
+        if "token_type_ids" in self.input_names:
+            inputs["token_type_ids"] = token_type_ids if token_type_ids is not None else np.zeros_like(input_ids)
+
+        outputs = self._inference(inputs)
+
+        last_hidden_state = outputs["last_hidden_state"]
+
+        embedding = last_hidden_state[:,0]
+
+        return embedding
+
+    def classify(self, text,**kwargs):
+
+        """ Implements a classify inference for classifier-based models that
+        have been fine-tuned with a classifier head"""
+
+        self.text_sample = text
+
+        if not isinstance(self.text_sample, list):
+            self.text_sample = [self.text_sample]
+
+        input_ids = []
+        attn_mask = []
+
+        tokenizer_output = self.tokenizer.encode_batch(self.text_sample)
+
+        for sequence in tokenizer_output:
+            input_ids.append(sequence.ids)
+            attn_mask.append(sequence.attention_mask)
+
+        input_ids = np.array(input_ids)
+        attn_mask = np.array(attn_mask)
+
+        np_inputs = isinstance(input_ids, np.ndarray)
+        if not np_inputs:
+            input_ids = np.array(input_ids)
+            attn_mask = np.array(attn_mask)
+
+        inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attn_mask,
+        }
+
+        # Add the token_type_ids when needed
+        if "token_type_ids" in self.input_names:
+            # may require customization for some model types
+            inputs["token_type_ids"] = np.zeros_like(input_ids)
+
+        outputs = self._inference(inputs)
+
+        logits = outputs["logits"]
+
+        max_value = np.max(logits, axis=-1, keepdims=True)
+        shifted_exp = np.exp(logits - max_value)
+        scores = shifted_exp / shifted_exp.sum(axis=-1, keepdims=True)
+
+        if "id2label" in self.config:
+            try:
+                dict_scores = [{"label": self.config["id2label"][str(i)],
+                                "score": score.item()} for i, score in enumerate(scores[0])]
+            except:
+                dict_scores = [{"label": "NA", "score": 0.0}]
+                logger.info(f"OVEmbeddingModel - classify configs not resolved - {self.config} - "
+                            f"{scores[0]}")
+        else:
+            # report scores without label if not available (e.g, missing config)
+            dict_scores = []
+            for i, score in enumerate(scores[0]):
+                new_entry = {"label": f"score_{i+1}", "score": score.item()}
+                dict_scores.append(new_entry)
+
+        dict_scores.sort(key=lambda x: x["score"], reverse=True)
+
+        self.register()
+
+        return dict_scores
+
+    def embedding (self, text_sample, api_key=None):
+
+        """ Executes embedding inference. """
+
+        self.text_sample = text_sample
+
+        #   call to preview (not implemented by default)
+        # self.preview()
+
+        # return embeddings only
+        if not isinstance(self.text_sample,list):
+            self.text_sample = [self.text_sample]
+
+        input_ids = []
+        attn_mask = []
+
+        tokenizer_output = self.tokenizer.encode_batch(self.text_sample)
+
+        for sequence in tokenizer_output:
+            input_ids.append(sequence.ids)
+            attn_mask.append(sequence.attention_mask)
+
+        input_ids = np.array(input_ids)
+        attn_mask = np.array(attn_mask)
+
+        model_input = {"input_ids": input_ids, "attention_mask": attn_mask}
+
+        # Add the token_type_ids when needed
+        if "token_type_ids" in self.input_names:
+            model_input["token_type_ids"] = np.zeros_like(input_ids)
+
+        outputs = self._inference(model_input)
+
+        last_hidden_state = outputs["last_hidden_state"]
+
+        embedding = last_hidden_state[:,0]
+
+        #   l2 normalization with numpy
+        embeddings_normalized = embedding / np.linalg.norm(embedding,2,axis=1,keepdims=True)
+
+        self.register()
+
+        return embeddings_normalized
+
+    def rank (self, query, text_results, text_index="text",
+              api_key=None, top_n=20, relevance_threshold=None, min_return=3):
+
+        """ Executes reranking inference. """
+
+        #   call to preview (not implemented by default)
+        # self.preview()
+
+        batches = []
+        if len(text_results) <= 32:
+            # need to package in chunks
+            batches.append(text_results)
+        else:
+            batch_count = len(text_results) // 32
+            if len(text_results) > batch_count * 32:
+                batch_count += 1
+            for x in range(0,batch_count):
+                stopper = min(len(text_results), (x+1)*32)
+                new_batch = text_results[x*32:stopper]
+                batches.append(new_batch)
+
+        output = []
+
+        for batch in batches:
+            documents = []
+            for i, chunks in enumerate(batch):
+                documents.append(chunks[text_index])
+
+            scores = self.compute_score(query, documents)
+
+            if not isinstance(scores,list):
+                scores = [scores]
+
+            for i, score in enumerate(scores):
+                batch[i].update({"rerank_score": score})
+                output.append(batch[i])
+
+        ranked_output = sorted(output, key=lambda x: x["rerank_score"], reverse=True)
+
+        #   will return top_n if no relevance threshold set
+        if not relevance_threshold:
+            if top_n < len(ranked_output):
+                final_output = ranked_output[0:top_n]
+            else:
+                final_output = ranked_output
+        else:
+            final_output = []
+            #   if relevance threshold, will return all results above threshold
+            for entries in ranked_output:
+                if entries["rerank_score"] >= relevance_threshold:
+                    final_output.append(entries)
+
+            #   fallback, if no result above threshold, then will return the min number of results
+            if len(final_output) == 0:
+                final_output = ranked_output[0:min_return]
+
+        self.register()
+
+        return final_output
+
+    def compute_score(self, query, documents, batch_size: int = 32):
+
+        """ Applies semantic similarity ranker to query and a set of text chunks. """
+
+        sentence_pairs = [[query, doc] for doc in documents]
+
+        # if empty query, then return [] for empty scores
+        if len(sentence_pairs) == 0:
+            return []
+
+        assert isinstance(sentence_pairs, list)
+        if isinstance(sentence_pairs[0], str):
+            sentence_pairs = [sentence_pairs]
+
+        #TODO: look at truncation settings
+        self.tokenizer.enable_truncation(100)
+        self.tokenizer.enable_padding(pad_token="<pad>")
+
+        all_scores = []
+        for start_index in range(0, len(sentence_pairs), batch_size):
+            sentences_batch = sentence_pairs[start_index: start_index + batch_size]
+
+            input_ids = []
+            attn_mask = []
+
+            tokenizer_output = self.tokenizer.encode_batch(sentences_batch)
+
+            for sequence in tokenizer_output:
+                input_ids.append(sequence.ids)
+                attn_mask.append(sequence.attention_mask)
+
+            input_ids = np.array(input_ids)
+            attn_mask = np.array(attn_mask)
+
+            #   note: last element is the 'position_type_ids'
+            model_input = (input_ids, attn_mask, np.zeros_like(input_ids))
+
+            scores = self._inference(model_input)
+            scores = self.sigmoid(scores["logits"].squeeze())
+
+            # safety check if single value, e.g., if input is only one document
+            if len(documents) == 1:
+                scores = [scores]
+            else:
+                scores = scores.tolist()
+            all_scores.extend(scores)
+
+        if len(all_scores) == 1:
+            all_scores = all_scores[0]
+
+        return all_scores
+
+
+class GGUFVisionGenerativeModel(BaseModel):
+
+    """ Implementation of GGUF Vision Model class - instantiate and run vision-to-text inferences using
+    GGUF llama.cpp models with MTMD CLIP-based visual encoding - wraps two underlying models (which interact
+    directly with each other) -
+
+        -- decoder generative model, e.g., llama main
+        -- encoder clip model, e.g., mtmd clip model
+
+    """
+
+    def __init__(self, model_name=None, model_card=None, api_key=None, prompt_wrapper=None, instruction_following=False,
+                 context_window=2048, use_gpu_if_available=True, get_logits=False,
+                 sample=True, max_output=500, temperature=0.0, api_endpoint=None, **kwargs):
+
+        super().__init__(**kwargs)
+
+        logger.debug("GGUFVisionGenerativeModel - initializing GGUF Vision model ... ")
+
+        self.model_class = "GGUFVisionGenerativeModel"
+        self.model_category = "generative"
+
+        # key model state attributes
+        self.gguf_file = None
+        self.gguf_repo = None
+        self.clip_file = None
+        self.clip_model = None
+
+        # main llama model
+        self._lib = None
+        self._model = None
+        self._ctx = None
+        self._batch = None
+        self.model_path = None
+        self.model_params = None
+        self.context_params = None
+
+        # attributes of mtmd backend lib and clip model
+        self._libmtmd = None
+        self.mtmd_ctx = None
+        self._clip_model = None
+
+        self.clip_ctx = None
+        self.clip_model_path = ""
+        self.clip_base_name = "mtmd"
+        self._clip_base_path = ""
+
+        self.llm_response = None
+        self.usage = None
+        self.logits = None
+        self.output_tokens = None
+        self.prompt = None
+        self.final_prompt = None
+        self._logits_all = False
+
+        #   set verbose level in environ level - will be picked up by callback in llama_cpp & mtmd
+        #   set to "ON" to view details for debugging
+        os.environ["llama_cpp_verbose"] = GGUFConfigs().get_config("llama_cpp_verbose")
+        #   e.g., os.environ["llama_cpp_verbose"] = "ON"
+
+        self.use_sampling = sample
+        self.get_logits = get_logits
+        self.logits_record = []
+        self.output_tokens = []
+        self.top_logit_count = 10
+        self.auto_remediate_function_call_output = True
+
+        #   default safety check in GGUF Configs that can be adjusted
+        gguf_configs_max = GGUFConfigs().get_config("max_output_tokens")
+
+        if max_output > gguf_configs_max:
+            # truncate max output to GGUFConfigs max
+            logger.warning(
+                f"GGUFVisionGenerativeModel - requested output len - {max_output} > {gguf_configs_max}, which is the "
+                f"current GGUF default max.\n--Truncating to {gguf_configs_max} output tokens.\n--Note: "
+                f"to change GGUF default max to new integer amount, say 500:\n "
+                f"  GGUFConfigs().set_config(\"max_output_tokens\", 500)"
+                )
+
+            max_output = gguf_configs_max
+
+        self.max_output = max_output
+        self.n_seq_max = max_output
+
+        self.target_requested_output_tokens = self.n_seq_max
+        self.max_total_len = 2048
+        self.max_input_len = int(0.5 * context_window)
+        self.llm_max_output_len = int(0.5 * context_window)
+        self.max_output_len = self.n_seq_max
+        self.model_name = model_name
+        self.prompt_wrapper = prompt_wrapper
+        self.instruction_following = instruction_following
+        self.trailing_space = ""
+        self.separator = "\n"
+        self.eos_token_id = 0
+        self.add_prompt_engineering = False
+        self.add_context = ""
+        self.model_type = "gguf"
+        self.model_card = model_card
+        self.primary_keys = None
+        self.function = None
+        self.hf_tokenizer_name = None
+        self.fc_supported = False
+
+        if model_card:
+
+            if "primary_keys" in model_card:
+                self.primary_keys = model_card["primary_keys"]
+
+            if "function" in model_card:
+                self.function = model_card["function"]
+
+            if "tokenizer" in model_card:
+                self.hf_tokenizer_name = model_card["tokenizer"]
+
+            if "function_call" in model_card:
+                self.fc_supported = model_card["function_call"]
+
+            if "trailing_space" in model_card:
+                self.trailing_space = model_card["trailing_space"]
+            else:
+                self.trailing_space = ""
+
+            if "eos_token_id" in model_card:
+                self.eos_token_id = model_card["eos_token_id"]
+
+            if "context_window" in model_card:
+                self.max_total_len = model_card["context_window"]
+
+            if "prompt_wrapper" in model_card:
+                self.prompt_wrapper = model_card["prompt_wrapper"]
+            else:
+                self.prompt_wrapper = "human_bot"
+
+            if "gguf_file" in model_card:
+                self.gguf_file = model_card["gguf_file"]  # e.g., "ggml-model-q4_k_m.gguf"
+
+            if "clip_file" in model_card:
+                self.clip_file = model_card["clip_file"]
+
+            if "gguf_repo" in model_card:
+                self.gguf_repo = model_card["gguf_repo"]  # e.g., "llmware/dragon-mistral-7b-v0-gguf"
+
+            if "instruction_following" in model_card:
+                self.instruction_following = model_card["instruction_following"]
+
+        #   temperature configuration
+
+        # if temperature set at time of loading the model, then use that setting
+        if temperature != -99:
+            self.temperature = temperature
+        elif "temperature" in model_card:
+            # if not set, then pull the default temperature from the model card
+            self.temperature = model_card["temperature"]
+        else:
+            # if no guidance from model loading or model card, then set at GGUFConfigs default
+            self.temperature = GGUFConfigs().get_config("temperature_default")
+
+        #   new option to 'force' use of cuda lib, and over-ride safety checks
+        if GGUFConfigs().get_config("force_gpu"):
+            self.use_gpu = True
+        else:
+            if sys.platform.lower() not in GGUFConfigs().get_config("cuda_platforms"):
+                self.use_gpu = False
+            else:
+                # min drivers set to the lowest level for CUDA 12.1 on Linux
+                min_drivers = [525, 60]
+                if sys.platform.lower() == "win32":
+                    min_drivers = GGUFConfigs().get_config("cuda_windows_driver_min")
+
+                gpu_available = ModelCatalog().gpu_available(driver_min_levels=min_drivers)
+
+                #   use_gpu set to TRUE only if:
+                #   (1) cuda_platform (e.g., linux or win32), e.g., not set on Mac OS
+                #   (2) use_gpu set to True in GGUFConfigs
+                #   (3) use_gpu_if_available flag set to True (by default)
+                #   (4) cuda found and drivers current via direct polling of nvidia-smi executable in
+                #   ModelCatalog.gpu_available method
+
+                self.use_gpu = (GGUFConfigs().get_config("use_gpu")
+                                and sys.platform.lower() in GGUFConfigs().get_config("cuda_platforms")
+                                and gpu_available["drivers_current"] and gpu_available["gpu_found"]
+                                and use_gpu_if_available)
+
+        # set default minimum
+        self.n_batch = 2048 # alt/previous: 512
+        self.last_n_tokens_size = 64
+        self._n_vocab = None
+        self._n_ctx = None
+        self._token_nl = None
+        self._token_eos = None
+        self._candidates = None
+        self.input_ids = None
+        self.scores = None
+        self.n_tokens = 0
+        self.prev = []
+        self.grammar = None
+
+        for key, value in GGUFConfigs().get_sampling_params().items():
+            setattr(self, key, value)
+
+        # no api key expected or required
+        self.api_key = api_key
+        self.api_endpoint = api_endpoint
+        self.error_message = "\nUnable to identify and load GGUF Vision Generative model."
+        self.prompt = ""
+        self.context = ""
+        self.tool_type = None
+        self.model_repo_path = None
+        self._sampler = None
+        self._last_image_embed = None
+        self._last_image_hash = None
+        self.file_path = ""
+        self.vocab = None
+
+        # not implemented currently keeps list of tuples - (file_path, embed)
+        # roadmap - capture image embeddings separately for re-use
+        self.embed_list = []
+        self.embed_tokens = []
+
+        self.verbose = True
+
+        self.post_init()
+
+    def __del__(self):
+
+        logger.info(f"GGUFVisionGenerativeModel - cleaning up mtmd free on closing model instance")
+
+        if self.mtmd_ctx is not None:
+            self._libmtmd.mtmd_free(self.mtmd_ctx)
+
+    def load_model_for_inference(self, model_repo_path, model_card=None, **kwargs):
+
+        """ Loads and instantiates model along with other required objects. """
+
+        # needs to load both llama + clip models
+
+        if model_card:
+            self.model_card = model_card
+
+        #   validate before loading
+        self.validate()
+
+        # load llama model
+        response = self._load_llama_model_for_inference(model_repo_path, model_card, **kwargs)
+        if not response:
+            logger.warning(f"GGUFVisionGenerativeModel - error loading llama backend model.")
+            # further triage and debug info steps ...
+            pass
+
+        # load clip model
+        response = self._load_clip_model_for_inference(model_repo_path, model_card, **kwargs)
+        if not response:
+            logger.warning(f"GGUFVisionGenerativeModel - error loading mtmd clip backend model.")
+            # further triage and debug info steps ...
+            pass
+
+        return self
+
+    def _load_clip_model_for_inference(self, model_repo_path, model_card=None, **kwargs):
+
+        """ Loads backend MTMD module along with instantiating CLIP Model and prepares associated context """
+
+        # load shared library
+        self._libmtmd = self.load_mtmd_shared_library()
+        self._libmtmd = add_libmtmd_ctypes_declarations(self._libmtmd)
+
+        # set up log (best effort) - catch and skip if any errors thrown
+
+        try:
+            self._libmtmd.mtmd_helper_log_set(mtmd_log_callback, ctypes.c_void_p(0))
+        except:
+            logger.info(f"GGUFVisionGenerativeModel - unable to set mtmd log")
+
+        ctx_params = self._libmtmd.mtmd_context_params_default()
+        ctx_params.use_gpu = True
+        ctx_params.print_timings = 0 # self.verbose
+
+        import multiprocessing
+        ctx_params.n_threads = max(multiprocessing.cpu_count() // 2, 1)
+
+        # deprecated
+        # ctx_params.verbosity = 0 # 2 if self.verbose else 0  # GGML_LOG_LEVEL_INFO = 2
+
+        if not self.clip_file:
+            self.clip_file = "mmproj-F16.gguf"
+
+        self.clip_model_path = os.path.join(model_repo_path, self.clip_file)
+
+        # Initialize mtmd context
+
+        self.mtmd_ctx = self._libmtmd.mtmd_init_from_file(self.clip_model_path.encode(),
+                                                          self._model.model, ctx_params)
+
+        if self.mtmd_ctx is None:
+            raise ValueError(f"Failed to load mtmd context from: {self.clip_model_path}")
+
+        # Check if vision is supported
+        if self._libmtmd.mtmd_support_vision(self.mtmd_ctx):
+
+            logger.info(f"GGUFVisionGenerativeModel - confirmed that model supports vision")
+        else:
+            logger.info(f"GGUFVisionGenerativeModel - model does not support vision - expect errors likely")
+
+        return True
+
+    def _load_llama_model_for_inference(self, model_repo_path, model_card=None, **kwargs):
+
+        """ Loads Llama model and sets context parameters """
+
+        # load shared library
+        self._lib = self._load_llama_cpp_shared_library()
+        self._lib = add_ctypes_declarations(self._lib)
+
+        if not GGUFConfigs().get_config("backend_initialized"):
+            # is this backend init required?
+            self._lib.llama_backend_init()
+            GGUFConfigs().set_config("backend_initialized", True)
+
+        self._lib.llama_log_set(llama_log_callback, ctypes.c_void_p(0))
+
+        self.model_params = self._lib.llama_model_default_params()
+
+        # update model params parameters
+        self.model_params.n_gpu_layers = 50
+
+        self.model_params.main_gpu = 0
+        self.model_params.vocab_only = False
+        self.model_params.use_mmap = True
+        self.model_params.use_mlock = False
+
+        if self.use_gpu:
+            # on darwin, keep at 0 - on win32 and linux - set to 50 by default (e.g., shift all model layers to GPU)
+            if sys.platform.lower() == "win32" or sys.platform.lower().startswith("linux"):
+                self.model_params.n_gpu_layers = GGUFConfigs().get_config("n_gpu_layers")
+
+        # update context parameters
+        self.context_params = self._lib.llama_context_default_params()
+
+        #   sets minimum of 2048, but will extend if context_window is larger (e.g., 4096/8192+)
+        # self.context_params.n_ctx = max(2048, self.max_total_len)
+        self.context_params.n_ctx = 8192  # 2048
+        self.context_params.n_batch = self.n_batch
+
+        n_ubatch = 512
+        self.context_params.n_ubatch = min(self.n_batch, n_ubatch)
+
+        # note: handcrafting of thread allocation can sometimes help performance substantially
+        import multiprocessing
+        self.context_params.n_threads = max(multiprocessing.cpu_count() // 2, 1)
+        self.context_params.n_threads_batch = multiprocessing.cpu_count()
+
+        # self.context_params.rope_scaling_type = (LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED)
+        # self.context_params.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED
+        self.context_params.rope_freq_base = 0.0  # (rope_freq_base if rope_freq_base != 0.0 else 0)
+        self.context_params.type_k = 1
+        self.context_params.type_v = 1
+        self.context_params.offload_kqv = True
+        self.context_params.yarn_orig_ctx = 0
+
+        if model_card:
+            self.model_name = model_card["model_name"].split("/")[-1]
+            self.gguf_file = model_card["gguf_file"]  # e.g., "ggml-model-q4_k_m.gguf",
+            self.gguf_repo = model_card["gguf_repo"]  # e.g., "llmware/dragon-mistral-7b-v0-gguf"
+
+        self.model_path = os.path.join(model_repo_path, self.gguf_file)
+
+        #   loads and instantiates the key objects
+        self._model = _LlamaModel(self._lib, path_model=self.model_path, params=self.model_params)
+        self._ctx = _LlamaContext(self._lib, model=self._model, params=self.context_params)
+        self._batch = _LlamaBatch(self._lib, n_tokens=self.n_batch, embd=0, n_seq_max=self.context_params.n_ctx)
+
+        self.vocab = self._lib.llama_model_get_vocab(self._model.model)
+        self._n_vocab = self.n_vocab()
+        self._n_ctx = self.n_ctx()
+        self._token_nl = self.token_nl()
+        self._token_eos = self.token_eos()
+        self._candidates = _LlamaTokenDataArray(n_vocab=self._n_vocab)
+        self.input_ids = np.ndarray((self._n_ctx,), dtype=np.intc)
+        self.scores = np.ndarray((self._n_ctx, self._n_vocab), dtype=np.single)
+
+        self._sampler = self._init_sampler()
+
+        return True
+
+    def _load_llama_cpp_shared_library(self):
+
+        """ Loads llama_cpp shared library - checks if a custom lib path has been configured - otherwise,
+        it loads the llmware provided dynamic libraries based on the platform/system. """
+
+        # check first if custom_lib_path - expected to be full path to custom so/dylib file
+        custom_path = GGUFConfigs().get_config("custom_lib_path")
+        cdll_args = dict()
+
+        # add option to fall_back if CUDA driver can not be loaded correctly to CPU driver for that OS
+        fall_back_option = ""
+
+        if custom_path:
+
+            # point to custom llama.cpp backend libs
+
+            if os.path.exists(custom_path):
+                _lib_paths = [custom_path]
+            else:
+                raise LLMWareException(message="ModuleNotFound error: could not find location of custom lib")
+
+        else:
+
+            _base_path = os.path.join(LLMWareConfig.get_config("shared_lib_path"), "gguf")
+
+            _lib_paths = []
+
+            system_platform = sys.platform.lower()
+
+            # Determine the file extension based on the platform
+            if system_platform.startswith("linux"):
+
+                # three linux versions supported - linux_x86 and linux_cuda
+
+                machine = os.uname().machine.lower()
+
+                if machine == "aarch64" and self.use_gpu:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_aarch64_cuda_lib"),
+                                                   GGUFConfigs().get_config("linux_cuda")))
+
+                elif self.use_gpu:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_cuda_lib"),
+                                                   GGUFConfigs().get_config("linux_cuda")))
+
+                    # will try to use x86 as fallback
+                    fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("linux_x86_lib"),
+                                                    GGUFConfigs().get_config("linux_x86"))
+
+                else:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_x86_lib"),
+                                                   GGUFConfigs().get_config("linux_x86")))
+
+            elif system_platform == "darwin":
+
+                _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("mac_metal_lib"),
+                                               GGUFConfigs().get_config("mac_metal")))
+
+            elif sys.platform == "win32":
+
+                import platform
+                if platform.machine().lower() == "arm64":
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_arm64_lib"),
+                                                   GGUFConfigs().get_config("windows_arm64")))
+
+                # windows cuda
+                elif self.use_gpu:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_cuda_lib"),
+                                                   GGUFConfigs().get_config("windows_cuda")))
+
+                    # new - will try to use x86 as fallback
+                    fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("windows_x86_lib"),
+                                                    GGUFConfigs().get_config("windows"))
+
+                else:
+                    # main case - windows x86
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_x86_lib"),
+                                                   GGUFConfigs().get_config("windows")))
+
+            else:
+                raise LLMWareException(message=f"No matching llama.cpp binary for platform - {system_platform}")
+
+            # Add the library directory to the DLL search path on Windows (if needed)
+            if sys.platform == "win32" and sys.version_info >= (3, 8):
+                os.add_dll_directory(str(_base_path))
+
+                # need to review
+                if "CUDA_PATH" in os.environ:
+                    os.add_dll_directory(os.path.join(os.environ["CUDA_PATH"], "bin"))
+                    os.add_dll_directory(os.path.join(os.environ["CUDA_PATH"], "lib"))
+
+                cdll_args["winmode"] = ctypes.RTLD_GLOBAL
+
+        # Try to load the shared library, handling potential errors
+        for _lib_path in _lib_paths:
+
+            logger.debug(f"Loading llama cpp backend - {_lib_path}")
+
+            if not os.path.exists(_lib_path):
+                if fall_back_option:
+                    _lib_path = fall_back_option
+
+            if os.path.exists(_lib_path):
+
+                try:
+                    return ctypes.cdll.LoadLibrary(str(_lib_path))
+                except Exception as e:
+
+                    #  if fail, and CUDA selected, then try to fall back to matching CPU version
+                    if fall_back_option:
+                        try:
+
+                            logger.warning("Not successful loading preferred lib so reverting to fallback lib.")
+
+                            return ctypes.cdll.LoadLibrary(str(_lib_path))
+                        except:
+
+                            # if fall-back fails
+                            raise GGUFLibNotLoadedException("llama_cpp_backend",
+                                                            sys.platform.lower(),
+                                                            self.use_gpu,
+                                                            _lib_path,
+                                                            custom_path)
+                    else:
+                        raise GGUFLibNotLoadedException("llama_cpp_backend" ,sys.platform.lower(),
+                                                        self.use_gpu, _lib_path, custom_path)
+
+        # if not loaded
+        raise LLMWareException(message=f"GGUFGenerativeModel - attempting to load llama cpp backend lib - "
+                                       f"Llama cpp backend not found.")
+
+    def _init_mtmd_context(self, llama_model):
+
+        """Initialize mtmd context with the llama model."""
+
+        self.mtmd_ctx = None
+
+        # Get default parameters
+        ctx_params = self._libmtmd.mtmd_context_params_default()
+        ctx_params.use_gpu = True  # todo: expose as configuration option directly
+        ctx_params.print_timings = self.verbose
+        ctx_params.n_threads = max(multiprocessing.cpu_count() // 2, 1)
+
+        # deprecated/removing
+        # ctx_params.verbosity = 2 if self.verbose else 0  # GGML_LOG_LEVEL_INFO = 2
+
+        # Initialize mtmd context
+        self.mtmd_ctx = self._libmtmd.mtmd_init_from_file(self.clip_model_path.encode(),
+                                                          llama_model.model,
+                                                          ctx_params)
+
+        if self.mtmd_ctx is None:
+            raise ValueError(f"Failed to load mtmd context from: {self.clip_model_path}")
+
+        # Check if vision is supported
+        if not self._libmtmd.mtmd_support_vision(self.mtmd_ctx):
+            raise ValueError("Vision is not supported by this model")
+
+        return True
+
+    def mtmd_free(self):
+
+        """ Deletes MTMD context """
+
+        if self.mtmd_ctx is not None:
+            self._mtmd_cpp.mtmd_free(self.mtmd_ctx)
+            self.mtmd_ctx = None
+
+        return True
+
+    def load_mtmd_shared_library(self):
+
+        """Platform independent shared library loader for mtmd lib backend """
+
+        # providing several backends packaged within llmware for the following:
+
+        # "windows_mtmd": "mtmd.dll",
+        # "mac_metal_mtmd": "libmtmd.dylib",
+        # "linux_x86_mtmd": "libmtmd.so",
+        # "linux_cuda_mtmd": "libmtmd.so",
+        # "windows_arm64_mtmd": "mtmd.dll",
+        # "windows_cuda_mtmd": "mtmd.dll",
+
+        # check first if custom_lib_path - expected to be full path to custom so/dylib file
+        custom_path = GGUFConfigs().get_config("custom_lib_path")
+        cdll_args = dict()
+
+        fall_back_option = ""
+
+        if custom_path:
+
+            if os.path.exists(custom_path):
+                _lib_paths = [custom_path]
+            else:
+                raise LLMWareException(message="ModuleNotFound error: could not find location of custom lib")
+
+        else:
+
+            _base_path = os.path.join(LLMWareConfig.get_config("shared_lib_path"), "gguf")
+
+            _lib_paths = []
+
+            system_platform = sys.platform.lower()
+
+            # Determine the file extension based on the platform
+            if system_platform.startswith("linux"):
+
+                # three linux versions supported - linux_x86 and linux_cuda
+
+                machine = os.uname().machine.lower()
+
+                if machine == "aarch64" and self.use_gpu:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_aarch64_cuda_lib"),
+                                                   GGUFConfigs().get_config("linux_cuda_mtmd")))
+
+                elif self.use_gpu:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_cuda_lib"),
+                                                   GGUFConfigs().get_config("linux_cuda_mtmd")))
+
+                    # will try to use x86 as fallback
+                    fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("linux_x86_lib"),
+                                                    GGUFConfigs().get_config("linux_x86_mtmd"))
+
+                else:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("linux_x86_lib"),
+                                                   GGUFConfigs().get_config("linux_x86_mtmd")))
+
+            elif system_platform == "darwin":
+
+                _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("mac_metal_lib"),
+                                               GGUFConfigs().get_config("mac_metal_mtmd")))
+
+            elif sys.platform == "win32":
+
+                import platform
+                if platform.machine().lower() == "arm64":
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_arm64_lib"),
+                                                   GGUFConfigs().get_config("windows_arm64_mtmd")))
+
+                # windows cuda
+                elif self.use_gpu:
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_cuda_lib"),
+                                                   GGUFConfigs().get_config("windows_cuda_mtmd")))
+
+                    # new - will try to use x86 as fallback
+                    fall_back_option = os.path.join(_base_path, GGUFConfigs().get_config("windows_x86_lib"),
+                                                    GGUFConfigs().get_config("windows_mtmd"))
+
+                else:
+                    # main case - windows x86
+                    _lib_paths.append(os.path.join(_base_path, GGUFConfigs().get_config("windows_x86_lib"),
+                                                   GGUFConfigs().get_config("windows_mtmd")))
+
+            else:
+                raise LLMWareException(message=f"No matching mtmd binary for platform - {system_platform}")
+
+            # Add the library directory to the DLL search path on Windows (if needed)
+            if sys.platform == "win32" and sys.version_info >= (3, 8):
+                os.add_dll_directory(str(_base_path))
+
+                # need to review
+                if "CUDA_PATH" in os.environ:
+                    os.add_dll_directory(os.path.join(os.environ["CUDA_PATH"], "bin"))
+                    os.add_dll_directory(os.path.join(os.environ["CUDA_PATH"], "lib"))
+
+                cdll_args["winmode"] = ctypes.RTLD_GLOBAL
+
+        # Try to load the shared library, handling potential errors
+        for _lib_path in _lib_paths:
+
+            logger.debug(f"Loading mtmd backend - {_lib_path}")
+
+            if not os.path.exists(_lib_path):
+                if fall_back_option:
+                    _lib_path = fall_back_option
+
+            if os.path.exists(_lib_path):
+
+                try:
+                    return ctypes.cdll.LoadLibrary(str(_lib_path))
+
+                except Exception as e:
+
+                    #  if fail, and CUDA selected, then try to fall back to matching CPU version
+                    if fall_back_option:
+
+                        try:
+
+                            logger.warning("Not successful loading preferred lib so reverting to fallback lib.")
+
+                            return ctypes.cdll.LoadLibrary(str(_lib_path))
+
+                        except:
+
+                            # if fall-back fails
+                            raise GGUFLibNotLoadedException("mtmd_backend",
+                                                            sys.platform.lower(),
+                                                            self.use_gpu,
+                                                            _lib_path,
+                                                            custom_path)
+                    else:
+                        raise GGUFLibNotLoadedException("mtmd_backend", sys.platform.lower(),
+                                                        self.use_gpu, _lib_path, custom_path)
+
+        # if not loaded
+        raise LLMWareException(message=f"GGUFVisionGenerativeModel - attempting to load mtmd backend lib - "
+                                       f"mtmd backend not found.")
+
+
+    def image_to_base64_data_uri(self, file_path):
+
+        """ Image handling utility """
+
+        import base64
+
+        with open(file_path, "rb") as img_file:
+            base64_data = base64.b64encode(img_file.read()).decode('utf-8')
+            return f"data:image/jpg;base64,{base64_data}"
+
+    def _create_bitmap_from_bytes(self, image_bytes: bytes):
+
+        """Create mtmd_bitmap from image bytes."""
+
+        if self.mtmd_ctx is None:
+            raise ValueError("mtmd context not initialized")
+
+        bitmap = self._libmtmd.mtmd_helper_bitmap_init_from_buf(
+            self.mtmd_ctx,
+            (ctypes.c_uint8 * len(image_bytes)).from_buffer(bytearray(image_bytes)),
+            len(image_bytes)
+        )
+
+        if bitmap is None:
+            raise ValueError("Failed to create bitmap from image bytes")
+
+        return bitmap
+
+    def prepare_image_prompt(self, prompt, image_path):
+
+        """ Main entry point for building image encodings and merging with token encodings to prepare
+        prompt for generative decoder model """
+
+        data_uri = self.image_to_base64_data_uri(image_path)
+        import base64
+        image_bytes = base64.b64decode(data_uri.split(",")[1])
+
+        bitmap = self._create_bitmap_from_bytes(image_bytes)
+
+        bitmaps = []
+        bitmap_cleanup = []
+        bitmaps.append(bitmap)
+        bitmap_cleanup.append(bitmap)
+
+        # Create input text structure
+        input_text = mtmd_input_text()
+        input_text.text = prompt.encode('utf-8')
+        input_text.add_special = True
+        input_text.parse_special = True
+
+        # Create input chunks
+        chunks = self._libmtmd.mtmd_input_chunks_init()
+        if chunks is None:
+            raise ValueError("Failed to create input chunks")
+
+        bitmap_array = (mtmd_bitmap_p_ctypes * len(bitmaps))(*bitmaps)
+
+        result = self._libmtmd.mtmd_tokenize(
+            self.mtmd_ctx,
+            chunks,
+            ctypes.byref(input_text),
+            bitmap_array,
+            len(bitmaps)
+        )
+
+        if result != 0:
+            raise ValueError(f"Failed to tokenize input: error code {result}")
+
+        # Reset llama context
+        self.reset()
+        memory = self._lib.llama_get_memory(self._ctx.ctx)
+        self._lib.llama_memory_clear(memory, True)
+
+        # Process each chunk
+        n_past = llama_pos(0)
+
+        n_chunks = self._libmtmd.mtmd_input_chunks_size(chunks)
+
+        for i in range(n_chunks):
+
+            chunk = self._libmtmd.mtmd_input_chunks_get(chunks, i)
+            if chunk is None:
+                continue
+
+            chunk_type = self._libmtmd.mtmd_input_chunk_get_type(chunk)
+
+            if chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT:
+                # Handle text chunk
+
+                n_tokens_out = ctypes.c_size_t()
+                tokens_ptr = self._libmtmd.mtmd_input_chunk_get_tokens_text(
+                    chunk, ctypes.byref(n_tokens_out)
+                )
+
+                if tokens_ptr and n_tokens_out.value > 0:
+                    # Convert ctypes array to Python list
+                    tokens = [tokens_ptr[j] for j in range(n_tokens_out.value)]
+
+                    if self.n_tokens + len(tokens) > self.n_ctx():
+                        raise ValueError(
+                            f"Prompt is larger than n_ctx: {self.n_tokens + len(tokens)} > {self.n_ctx()}"
+                        )
+
+                    self.eval(tokens)
+
+            elif chunk_type in [MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                                MTMD_INPUT_CHUNK_TYPE_AUDIO]:
+
+                chunk_n_tokens = self._libmtmd.mtmd_input_chunk_get_n_tokens(chunk)
+
+                if self.n_tokens + chunk_n_tokens > self.n_ctx():
+                    raise ValueError(
+                        f"Prompt is larger than n_ctx: {self.n_tokens + chunk_n_tokens} > {self.n_ctx()}"
+                    )
+
+                new_n_past = llama_pos(0)
+
+                result = self._libmtmd.mtmd_helper_eval_chunk_single(
+                    self.mtmd_ctx,
+                    self._ctx.ctx,
+                    chunk,
+                    llama_pos(self.n_tokens),
+                    llama_seq_id(0),
+                    self.n_batch,
+                    False,  # logits_last
+                    ctypes.byref(new_n_past)
+                )
+
+                if result != 0:
+                    raise ValueError(f"Failed to evaluate chunk: error code {result}")
+
+                self.n_tokens = new_n_past.value
+
+            prompt = self.input_ids[: self.n_tokens].tolist()
+
+        self._libmtmd.mtmd_input_chunks_free(chunks)
+
+        state_size = self._lib.llama_state_get_size(self._ctx.ctx)
+
+        return prompt
+
+    def _init_sampler(self):
+
+        """ Initializes and sets up the llama cpp backend sampler """
+
+        # create sampler
+        # default params are struct
+        params = llama_sampler_chain_params()
+        self._sampler = self._lib.llama_sampler_chain_init(params)
+
+        temp = 0.0
+
+        # todo: expose more sampling options
+
+        if temp < 0.0:
+            # sampler.add_softmax()
+            self._lib.llama_sampler_chain_add(self._sampler, self._lib.llama_sampler_init_softmax())
+            # sampler.add_dist(self._seed)
+
+        elif temp == 0.0:
+            # sampler.add_greedy()
+            greedy_sampler = self._lib.llama_sampler_init_greedy()
+
+            self._lib.llama_sampler_chain_add(self._sampler, greedy_sampler)
+
+        return self._sampler
+
+    def _inference(self, prompt):
+
+        """ Tokenizes the prompt and executes generation loop. """
+
+        # self._sampler = self._init_sampler()
+
+        t0 = time.time()
+
+        completion_tokens = [] if len(prompt) > 0 else [self.token_bos()]
+
+        prompt_tokens = (
+            (
+                self.tokenize(prompt.encode("utf-8"), special=True)
+                if prompt != ""
+                else [self.token_bos()]
+            )
+            if isinstance(prompt, str)
+            else prompt
+        )
+
+        # confirm that input is smaller than context_window
+        input_len = len(prompt_tokens)
+        context_window = self.n_ctx()
+
+        if input_len > context_window:
+            logger.warning("GGUFCLIPGenerativeModel - input is too long for model context window - "
+                           "truncating")
+            min_output_len = 10
+            prompt_tokens = prompt_tokens[0:context_window - min_output_len]
+            input_len = len(prompt_tokens)
+
+        text = b""
+
+        # first token capture starts here
+        get_first_token_speed = GGUFConfigs().get_config("get_first_token_speed")
+
+        token_counter = 0
+        t_gen_start = time.time()
+        first_token_processing_time = -1.0
+
+        for token in self.generate(prompt_tokens):
+
+            # first token capture
+            if get_first_token_speed:
+                if token_counter == 0:
+                    first_token_processing_time = time.time() - t_gen_start
+                    token_counter += 1
+            # first token capture ends here
+
+            if self.get_logits:
+                self.register_top_logits()
+                self.output_tokens.append(token)
+
+            if token == self._token_eos:
+                text = self.detokenize(completion_tokens)
+                break
+
+            completion_tokens.append(token)
+
+            #   stop at max output len
+            if len(completion_tokens) >= self.max_output_len:
+                text = self.detokenize(completion_tokens)
+                break
+
+            #   stop if combined input + output at context window size
+            if (input_len + len(completion_tokens)) >= context_window:
+                text = self.detokenize(completion_tokens)
+                break
+
+        text_str = text.decode("utf-8", errors="ignore")
+
+        # post-processing clean-up - stop at endoftext
+        eot = text_str.find("<|endoftext|>")
+        if eot > -1:
+            text_str = text_str[:eot]
+
+        # new post-processing clean-up - stop at </s>
+        eots = text_str.find("</s>")
+        if eots > -1:
+            text_str = text_str[:eots]
+
+        # post-processing clean-up - start after bot wrapper
+        bot = text_str.find("<bot>:")
+        if bot > -1:
+            text_str = text_str[bot + len("<bot>:"):]
+
+        # new post-processing cleanup - skip repeating starting <s>
+        boss = text_str.find("<s>")
+        if boss > -1:
+            text_str = text_str[boss + len("<s>"):]
+
+        # end - post-processing
+
+        if get_first_token_speed:
+
+            output = {"llm_response": text_str,
+                      "usage": {"input": len(prompt_tokens), "output": len(completion_tokens),
+                                "total": len(prompt_tokens) + len(completion_tokens), "metric": "tokens",
+                                "processing_time": time.time() - t0,
+                                "first_token_processing_time": first_token_processing_time}}
+        else:
+            output = {"llm_response": text_str,
+                      "usage": {"input": len(prompt_tokens), "output": len(completion_tokens),
+                                "total": len(prompt_tokens) + len(completion_tokens), "metric": "tokens",
+                                "processing_time": time.time() - t0}}
+
+        if self.get_logits:
+            output.update({"logits": self.logits_record, "output_tokens": self.output_tokens})
+
+        return output
+
+    def sample_gguf(self, idx=None):
+
+        """ Adapted to sample_gguf to avoid potential name space conflicts. """
+
+        # assert self.n_tokens > 0
+
+        tmp_sampler = False
+
+        if self._sampler is None:
+            tmp_sampler = True
+            self._sampler = self._init_sampler()
+
+        ridx = idx - self.n_tokens if idx is not None else -1
+
+        assert self.ctx is not None
+
+        token = self._lib.llama_sampler_sample(self._sampler, self._ctx.ctx, ridx)
+
+        # token = int(self.logits_record[-1][0][0])
+
+        if tmp_sampler:
+            self._sampler = None
+
+        return token
+
+    def generate(self, tokens, reset=True):
+
+        """ Generator that samples the model and yields tokens until stopped. """
+
+        # test
+
+        # Check for kv cache prefix match
+        if reset and self.n_tokens > 0:
+            longest_prefix = 0
+            for a, b in zip(self._input_ids, tokens[:-1]):
+                if a == b:
+                    longest_prefix += 1
+                else:
+                    break
+            if longest_prefix > 0:
+                reset = False
+                tokens = tokens[longest_prefix:]
+                self.n_tokens = longest_prefix
+
+        # Reset the model state
+        # reset = False
+        if reset:
+            self.reset()
+
+        sample_idx = self.n_tokens + len(tokens) - 1
+        tokens = list(tokens)
+
+        tokens_created = 0
+        input_start_len = len(tokens)
+
+        memory = self._ctx.memory
+
+        # Eval and sample
+        while True:
+
+            self._lib.llama_memory_seq_rm(memory, -1, self.n_tokens, -1)
+
+            for i in range(0, len(tokens), self.n_batch):
+                batch = tokens[i: min(len(tokens), i + self.n_batch)]
+                n_past = self.n_tokens
+                n_tokens = len(batch)
+
+                self._batch.set_batch(batch=batch, n_past=n_past, logits_all=self._logits_all)
+
+                return_code = self._lib.llama_decode(self._ctx.ctx, self._batch.batch)
+
+                # TODO: add better error handling if return_code 1 - usually overflow of ctx
+                if return_code != 0:
+                    raise RuntimeError(f"llama_decode call returned {return_code} - in most cases, this "
+                                       f"is due to exceeding the maximum context window.")
+
+                self.input_ids[n_past: n_past + n_tokens] = batch
+                rows = n_tokens
+                cols = self._n_vocab
+                offset = (0 if self._logits_all else n_tokens - 1)
+
+                if self._logits_all:
+                    rows = n_tokens
+                    cols = self._n_vocab
+                    logits = np.ctypeslib.as_array(
+                        self._ctx.get_logits(), shape=(rows * cols,))
+                    self.scores[n_past: n_past + n_tokens, :].reshape(-1)[::] = logits
+
+                self.n_tokens += n_tokens
+
+                # leaving hard-coded off for now (improves performance)
+                # self.register_top_logits()
+
+            while sample_idx < self.n_tokens:
+
+                logits = self._scores[-1, :]
+
+                self.prev = list(self.eval_tokens)
+
+                # sample to generate token from logits
+                token = self.sample_gguf(idx=sample_idx)  # (logits_array=logits)
+
+                self.accept(id=id, apply_grammar=None)
+
+                tokens_created += 1
+
+                sample_idx += 1
+
+                tokens_or_none = yield token
+                tokens.clear()
+                tokens.append(token)
+                if tokens_or_none is not None:
+                    tokens.extend(tokens_or_none)
+
+                if sample_idx < self.n_tokens and token != self._input_ids[sample_idx]:
+                    self.n_tokens = sample_idx
+
+                    self._lib.llama_memory_seq_rm(self._lib.llama_get_memory(self._ctx.ctx), -1, self.n_tokens, -1)
+                    break
+
+                if tokens_created > self.max_output_len:
+                    logger.info("GGUFVisionGenerativeModel - stopping generation loop - reached limit of "
+                                "max output len")
+                    break
+
+    def tokenize(self, text, add_bos=True, special=False):
+
+        """ Tokenizes text. """
+
+        n_ctx = self.n_ctx_train()
+        tokens = (ctypes.c_int32 * n_ctx)()
+        # change from self._model.model
+        n_tokens = self._lib.llama_tokenize(self.vocab, text, len(text), tokens, n_ctx, add_bos, special)
+
+        if n_tokens < 0:
+            n_tokens = abs(n_tokens)
+            tokens = (ctypes.c_int32 * n_tokens)()
+
+            n_tokens = self._lib.llama_tokenize(self.vocab, text, len(text), tokens, n_tokens, add_bos, special)
+
+            if n_tokens < 0:
+                raise RuntimeError(f"GGUFVisionGenerativeModel - tokenization error - "
+                                   f"{text} - n_tokens={n_tokens}")
+
+        return list(tokens[:n_tokens])
+
+    def detokenize(self, tokens, special: bool = False) -> bytes:
+        output = b""
+        size = 32
+        buffer = (ctypes.c_char * size)()
+        for token in tokens:
+            n = self._lib.llama_token_to_piece(
+                # replace: self.model
+                self.vocab, llama_token(token), buffer, size, 0, special
+            )
+            assert n <= size
+            output += bytes(buffer[:n])
+
+        # following llama_cpp_python on below ...
+        # NOTE: Llama1 models automatically added a space at the start of the prompt
+        # this line removes a leading space if the first token is a beginning of sentence token
+
+        return (
+            output[1:]
+            if len(tokens) > 0 and tokens[0] == self.token_bos() and output[0:1] == b" "
+            else output
+        )
+
+    def accept(self, id, apply_grammar):
+
+        """ Formal step post sampling that 'accepts' and adds the token id to the running generation. """
+
+        if apply_grammar and self.grammar is not None:
+            self._lib.llama_grammar_accept_token(self._ctx.ctx, self.grammar.grammar, id)
+
+        self.prev.append(id)
+
+    def register_top_logits(self):
+
+        """ Gets the top logits and keeps a running log for output analysis. """
+
+        # TODO:  there is issue with first logit computation - not corresponding to first token
+        logit_pointer = self._lib.llama_get_logits(self._ctx.ctx)
+
+        logit_size = self.n_vocab()
+        logit_array = np.zeros(logit_size)
+        for x in range(0, logit_size):
+            logit_array[x] = logit_pointer[x]
+
+        sm = np.exp(logit_array) / sum(np.exp(logit_array))
+
+        sm_sorted = np.sort(sm)
+        sm_args_sorted = np.argsort(sm)
+
+        top_logits = []
+
+        for x in range(0, self.top_logit_count):
+            # experiment - try rounding the float number
+            pair = (sm_args_sorted[logit_size - x - 1], round(sm_sorted[logit_size - x - 1], 3))
+            top_logits.append(pair)
+            # print("--test: logits - ", x, top_logits)
+
+        self.logits_record.append(top_logits)
+
+        return top_logits
+
+    def set_api_key(self, api_key, env_var="USER_MANAGED_GGUF_API_KEY"):
+
+        """ Sets API key - generally not used in GGUF models. """
+
+        # set api_key
+        os.environ[env_var] = api_key
+        logger.info("added and stored GGUF api_key in environmental variable- %s", env_var)
+
+        return self
+
+    def _get_api_key(self, env_var="USER_MANAGED_GGUF_API_KEY"):
+
+        """ Gets API key - generally not used in GGUF models. """
+
+        self.api_key = os.environ.get(env_var)
+
+        if not self.api_key:
+            logger.warning("_get_api_key could not successfully retrieve value from: %s ", env_var)
+
+        return self.api_key
+
+    @property
+    def ctx(self):
+        return self._ctx.ctx
+
+    @property
+    def model(self):
+        return self._model.model
+
+    @property
+    def _input_ids(self):
+        return self.input_ids[: self.n_tokens]
+
+    @property
+    def _scores(self):
+        return self.scores[: self.n_tokens, :]
+
+    @property
+    def eval_tokens(self):
+        return deque(self.input_ids[: self.n_tokens].tolist(), maxlen=self._n_ctx)
+
+    def eval(self, tokens):
+
+        """Evaluate a list of tokens.
+
+        Args:
+            tokens: The list of tokens to evaluate.
+        """
+
+        memory = self._ctx.memory
+        self._lib.llama_memory_seq_rm(memory, -1, self.n_tokens, -1)
+
+        for i in range(0, len(tokens), self.n_batch):
+            batch = tokens[i: min(len(tokens), i + self.n_batch)]
+            n_past = self.n_tokens
+            n_tokens = len(batch)
+            self._batch.set_batch(
+                batch=batch, n_past=n_past, logits_all=self._logits_all
+            )
+
+            self._lib.llama_decode(self._ctx.ctx, self._batch.batch)
+
+            # Save tokens
+            self.input_ids[n_past: n_past + n_tokens] = batch
+
+            # Save logits
+            if self._logits_all:
+                rows = n_tokens
+                cols = self._n_vocab
+                logits = np.ctypeslib.as_array(
+                    self._ctx.get_logits(), shape=(rows * cols,)
+                )
+                self.scores[n_past: n_past + n_tokens, :].reshape(-1)[::] = logits
+            else:
+                pass
+            # Update n_tokens
+
+            self.n_tokens += n_tokens
+
+    @property
+    def eval_logits(self):
+        return deque(
+            self.scores[: self.n_tokens, :].tolist(),
+            maxlen=self._n_ctx if self._logits_all else 1,
+        )
+
+    def reset(self):
+        self.n_tokens = 0
+
+    def n_ctx(self):
+        return self._lib.llama_n_ctx(self._ctx.ctx)
+
+    def n_ctx_train(self):
+        return self._lib.llama_n_ctx_train(self._model.model)
+
+    def n_vocab(self):
+        # llama_model_get_vocab(model)
+        n_vocab = self._lib.llama_n_vocab(self._lib.llama_model_get_vocab(self._model.model))
+        return n_vocab
+
+    def token_eos(self):
+        # return self._lib.llama_token_eos(self._model.model)
+        eos = self._lib.llama_token_eos(self.vocab)
+        return eos
+
+    def token_bos(self):
+        # return self._lib.llama_token_bos(self._model.model)
+        bos = self._lib.llama_token_bos(self.vocab)
+        return bos
+
+    def token_nl(self):
+        token_nl = self._lib.llama_token_nl(self._lib.llama_model_get_vocab(self._model.model))
+        # return self._lib.llama_token_nl(self._model.model)
+        return token_nl
+
+    def unload_model(self):
+
+        """ Unloads a model to release memory """
+
+        # note: removing pointer seems to safely remove from Python reference tracking
+
+        self._batch = None
+        self._ctx = None
+        self._model = None
+
+        return 0
+
+    def inference(self, prompt, image_path, add_context=None, add_prompt_engineering=None, api_key=None,
+                  inference_dict=None, get_logits=False, disable_eos=False):
+
+        """ Main method for inference generation. """
+
+        logger.info("GGUFVisionGenerativeModel - Starting generation inference")
+
+        time_start = time.time()
+
+        media_marker = self._libmtmd.mtmd_default_marker().decode('utf-8')
+        text = "\n" + str(media_marker) + prompt
+
+        self.prompt = text
+        prompt = self.prompt
+
+        if add_context:
+            self.add_context = add_context
+
+        if add_prompt_engineering:
+            self.add_prompt_engineering = add_prompt_engineering
+
+        #   update default handling for no add_prompt_engineering
+
+        if not self.add_prompt_engineering:
+            if self.add_context:
+                self.add_prompt_engineering = "default_with_context"
+            else:
+                self.add_prompt_engineering = "default_no_context"
+
+        # start with clean logits_record and output_tokens for each function call
+        self.logits_record = []
+        self.output_tokens = []
+
+        if get_logits:
+            self.get_logits = get_logits
+
+        if inference_dict:
+
+            if "temperature" in inference_dict:
+                self.temperature = inference_dict["temperature"]
+
+            if "max_tokens" in inference_dict:
+                self.target_requested_output_tokens = inference_dict["max_tokens"]
+
+        #   preview before generation
+        # self.preview()
+
+        # prompt = prompt
+
+        if self.add_prompt_engineering:
+            prompt_enriched = self.prompt_engineer(self.prompt, self.add_context, inference_dict=inference_dict)
+            prompt_final = prompt_enriched
+
+            # most models perform better with no trailing space or line-break at the end of prompt
+            #   -- in most cases, the trailing space will be ""
+            #   -- yi model prefers a trailing "\n"
+            #   -- keep as parameterized option to maximize generation performance
+            #   -- can be passed either thru model_card or model config from HF
+
+            prompt = prompt_final + self.trailing_space
+
+        # prepare embedded image prompt with fully templated prompt
+        prompt_tokens = self.prepare_image_prompt(prompt, image_path)
+
+        # output_response = self._inference(text_prompt)
+
+        #   starts _inference here
+        completion_tokens = [] if len(prompt_tokens) > 0 else [self.token_bos()]
+
+        # todo: safety checks to confirm that input is smaller than context_window
+        input_len = len(prompt_tokens)
+        context_window = self.n_ctx()
+
+        text = b""
+
+        token_list = []
+        token_counter = 0
+        text_output = ""
+
+        for token in self.generate(prompt_tokens):
+
+            completion_tokens.append(token)
+
+            if not disable_eos:
+                if token == self._token_eos:
+                    break
+
+            if len(completion_tokens) > self.max_output_len:
+                break
+
+            #   stop if combined input + output at context window size
+            if (input_len + len(completion_tokens)) >= context_window:
+                break
+
+            new_token = self.detokenize([token]).decode('utf-8', errors='ignore')
+
+            text_output += new_token
+            token_counter += 1
+
+        # text_str = text_output.decode("utf-8", errors="ignore")
+
+        usage = {"input": input_len,
+                 "output": token_counter,
+                 "total": input_len + token_counter,
+                 "metric": "tokens",
+                 "processing_time": time.time() - time_start}
+
+        response = {"llm_response": text_output, "usage": usage}
+
+        self.register()
+
+        return response
+
+    def stream(self, prompt, image_path, add_context=None, add_prompt_engineering=None, api_key=None,
+               inference_dict=None,
+               get_logits=False, disable_eos=False):
+
+        """ Main method for text streaming generation. Returns a generator function that yields one
+        token at a time for real-time streaming to console or UI. """
+
+        logger.info("GGUFVisionGenerativeModel - Starting generation stream")
+
+        media_marker = self._libmtmd.mtmd_default_marker().decode('utf-8')
+        text = "\n" + str(media_marker) + prompt
+
+        self.prompt = text
+        prompt = self.prompt
+
+        if add_context:
+            self.add_context = add_context
+
+        if add_prompt_engineering:
+            self.add_prompt_engineering = add_prompt_engineering
+
+        #   update default handling for no add_prompt_engineering
+
+        if not self.add_prompt_engineering:
+            if self.add_context:
+                self.add_prompt_engineering = "default_with_context"
+            else:
+                self.add_prompt_engineering = "default_no_context"
+
+        # start with clean logits_record and output_tokens for each function call
+        self.logits_record = []
+        self.output_tokens = []
+
+        if get_logits:
+            self.get_logits = get_logits
+
+        if inference_dict:
+
+            if "temperature" in inference_dict:
+                self.temperature = inference_dict["temperature"]
+
+            if "max_tokens" in inference_dict:
+                self.target_requested_output_tokens = inference_dict["max_tokens"]
+
+        #   preview before generation
+        # self.preview()
+
+        # prompt = prompt
+
+        if self.add_prompt_engineering:
+            prompt_enriched = self.prompt_engineer(self.prompt, self.add_context, inference_dict=inference_dict)
+            prompt_final = prompt_enriched
+
+            # most models perform better with no trailing space or line-break at the end of prompt
+            #   -- in most cases, the trailing space will be ""
+            #   -- yi model prefers a trailing "\n"
+            #   -- keep as parameterized option to maximize generation performance
+            #   -- can be passed either thru model_card or model config from HF
+
+            prompt = prompt_final + self.trailing_space
+
+        # prepare embedded image prompt with fully templated prompt
+        prompt_tokens = self.prepare_image_prompt(prompt, image_path)
+
+        # output_response = self._inference(text_prompt)
+
+        #   starts _inference here
+        completion_tokens = [] if len(prompt_tokens) > 0 else [self.token_bos()]
+
+        #todo: safety checks to confirm that input is smaller than context_window
+        input_len = len(prompt_tokens)
+        context_window = self.n_ctx()
+
+        text = b""
+
+        # disable_eos = True
+        token_list = []
+
+        for token in self.generate(prompt_tokens):
+
+            completion_tokens.append(token)
+
+            if not disable_eos:
+                if token == self._token_eos:
+                    break
+
+            if len(completion_tokens) > self.max_output_len:
+                break
+
+            #   stop if combined input + output at context window size
+            if (input_len + len(completion_tokens)) >= context_window:
+                break
+
+            new_token = self.detokenize([token]).decode('utf-8', errors='ignore')
+
+            yield new_token
+
+        text_str = text.decode("utf-8", errors="ignore")
+
+        #   turned off
+        self.register()
+
+        return text_str
+
+
+    def function_call(self, context, function=None, params=None,get_logits=True,temperature=-99.0,max_output=None):
+        """ Not implemented for this model class. """
+        return True
+
+    def function_call_over_api_endpoint(self, context="", tool_type="", model_name="", params="", prompt="",
+                                        function=None, endpoint_base=None, api_key=None, get_logits=False):
+        """ Not implemented for this model class """
+        return True
+
+    def inference_over_api_endpoint(self, prompt, context=None, inference_dict=None, get_logits=False):
+        """ Not implemented for this model class """
+        return True

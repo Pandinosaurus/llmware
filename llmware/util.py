@@ -1,5 +1,5 @@
 
-# Copyright 2023-2024 llmware
+# Copyright 2023-2026 llmware
 
 # Licensed under the Apache License, Version 2.0 (the "License"); you
 # may not use this file except in compliance with the License.  You
@@ -27,7 +27,6 @@ import random
 import platform
 from pathlib import Path
 import re
-from tokenizers import Tokenizer
 from datetime import datetime
 from ctypes import *
 import shutil
@@ -35,9 +34,16 @@ import shutil
 import logging
 
 from llmware.resources import CloudBucketManager
-from llmware.configs import LLMWareConfig
-from llmware.exceptions import (ModelNotFoundException, LLMWareException,
-                                DependencyNotInstalledException, ModuleNotFoundException)
+from llmware.configs import (LLMWareConfig, LLMWareException, ModuleNotFoundException,
+                             DependencyNotInstalledException, ModelNotFoundException)
+
+
+try:
+    from tokenizers import Tokenizer
+except:
+    logging.warning("tokenizers library could not be imported - some functionality may not be available.\n"
+                    "to fix:  pip3 install tokenizers")
+    tokenizers = None
 
 logger = logging.getLogger(__name__)
 
@@ -47,65 +53,7 @@ class Utilities:
     """ Utility functions used throughout LLMWare """
 
     def __init__(self, library=None):
-        self.start = 0
         self.library = library
-
-    def get_module_graph_functions(self):
-
-        """ Loads shared libraries for Graph module based on current platform/architecture. """
-
-        # Detect based on machine architecture
-        if platform.system() == "Windows":
-            system = "windows"
-            machine = "x86_64"
-            file_ext = ".dll"
-        else:
-            system = platform.system().lower()
-            machine = os.uname().machine.lower()
-            file_ext = ".so"
-
-        # Default to known architectures if we encounter an unknown one
-        if system == 'darwin' and machine not in ['arm64', 'x86_64']:
-            machine = 'arm64'
-        if system == 'linux' and machine not in ['aarch64', 'x86_64']:
-            machine = 'x86_64'
-
-        #   deprecation warning for aarch64 linux
-        if system == 'linux' and machine == 'aarch64':
-            logger.warning("Deprecation warning: as of llmware 0.2.7, we are deprecating support for aarch64 "
-                           "linux - we build, support and test on Linux x86_64, Linux x86_64 with CUDA, "
-                           "Windows x86_64, Windows x86_64 with CUDA, and Mac Metal.  We will revisit "
-                           "platform support from time-to-time, due to availability and interest.  "
-                           "If you have an important need for support for aarch 64 linux, please "
-                           "raise an issue at github/llmware-ai/llmware.git")
-
-        #   deprecation warning for darwin x86_64
-        if system == "darwin" and machine == "x86_64":
-            logger.warning("Deprecation warning: as of llmware 0.2.11, we are deprecating support for Mac x86_64 - "
-                           "we build, support, and test on Linux x86_64, Linux x86_64 with CUDA, Windows "
-                           "x86_64, Windows x86_64 with CUDA, and Mac Metal (M1-M2-M3).  We will revisit "
-                           "platform support from time-to-time, due to availability and interest.  "
-                           "If you have an important need to support this older version of Mac, please raise an "
-                           "issue at github/llmware-ai/llmware.git")
-
-        # Construct the path to a specific lib folder.  Eg. .../llmware/lib/darwin/x86_64
-        machine_dependent_lib_path = os.path.join(LLMWareConfig.get_config("shared_lib_path"), system, machine)
-
-        # replace for local testing:  file_ext -> .dylib
-        _path_graph = os.path.join(machine_dependent_lib_path, "llmware", "libgraph_llmware" + file_ext)
-
-        _mod_utility = None
-
-        try:
-            _mod_utility = cdll.LoadLibrary(_path_graph)
-        except:
-            logger.warning(f"warning: Module 'Graph Processor' could not be loaded from path - "
-                           f"\n {_path_graph}.\n")
-
-        if not _mod_utility:
-            raise ModuleNotFoundException("Graph Processor")
-
-        return _mod_utility
 
     def get_module_pdf_parser(self):
 
@@ -114,8 +62,17 @@ class Utilities:
         # Detect machine architecture
         if platform.system() == "Windows":
             system = "windows"
-            machine = "x86_64"
             file_ext = ".dll"
+
+            if platform.machine().lower() == "arm64":
+                machine = "arm64"
+                if LLMWareConfig().get_active_db() != "sqlite":
+                    logger.warning(f"Currently Windows Arm64 parser only supports SQLite.  Automatically "
+                                   f"changing active db setting to SQLite.")
+                    LLMWareConfig().set_active_db("sqlite")
+
+            else:
+                machine = "x86_64"
         else:
             system = platform.system().lower()
             machine = os.uname().machine.lower()
@@ -127,28 +84,25 @@ class Utilities:
         if system == 'linux' and machine not in ['aarch64', 'x86_64']:
             machine = 'x86_64'
 
-        # deprecation warning for aarch64 linux
         if system == 'linux' and machine == 'aarch64':
-            logger.warning("Deprecation warning: as of llmware 0.2.7, we are deprecating support for aarch64 "
-                           "linux - we build, support and test the following strategic platforms - Linux x86_64, "
-                           "Linux x86_64 with CUDA, Windows x86_64, Windows x86_64 with CUDA, and Mac Metal.  "
-                           "We will revisit from time-to-time, due "
-                           "to availability and interest.  If you have an important need for "
-                           "support for aarch 64 linux, please raise an issue at github/llmware-ai/llmware.git")
+
+            """ 0.4.4 - aarch64 linux in process of being supported 
+                -- re-integrating parsers on aarch64 linux 
+                -- removing deprecation warnings """
+
+            pass
 
         #   deprecation warning for darwin x86_64
         if system == "darwin" and machine == "x86_64":
-            logger.warning("Deprecation warning: as of llmware 0.2.11, we are deprecating support for Mac x86_64 - "
-                           "we build, support, and test on Linux x86_64, Linux x86_64 with CUDA, Windows "
-                           "x86_64, Windows x86_64 with CUDA, and Mac Metal (M1-M2-M3).  We will revisit "
-                           "platform support from time-to-time, due to availability and interest.  "
-                           "If you have an important need to support this older version of Mac, please raise an "
-                           "issue at github/llmware-ai/llmware.git")
 
-        # Construct the path to a specific lib folder.  Eg. .../llmware/lib/darwin/x86_64
+            error_msg = ("Mac x86 detected as OS - this is not a supported platform.  Support "
+                         "was deprecated in llmware version 0.2.6 and removed in llmware version 0.3.9. "
+                         "Options - move to Mac Metal (M1+), back-level llmware to supported version, or "
+                         "if urgent requirement for Mac x86, please raise ticket on github.")
+
+            raise LLMWareException(message=error_msg)
+
         machine_dependent_lib_path = os.path.join(LLMWareConfig.get_config("shared_lib_path"), system, machine)
-
-        # shift to file_ext
         _path_pdf = os.path.join(machine_dependent_lib_path, "llmware", "libpdf_llmware" + file_ext)
 
         _mod_pdf = None
@@ -159,8 +113,7 @@ class Utilities:
 
         except:
             # catch error, if possible
-            logger.warning(f"warning: Module 'PDF Parser' could not be loaded from path - "
-                           f"\n {_path_pdf}.\n")
+            logger.warning(f"Module 'PDF Parser' could not be loaded from path - \n {_path_pdf}.\n")
 
         #   if no module loaded, then raise exception
         if not _mod_pdf:
@@ -175,8 +128,18 @@ class Utilities:
         # Detect machine architecture
         if platform.system() == "Windows":
             system = "windows"
-            machine = "x86_64"
             file_ext = ".dll"
+
+            if platform.machine().lower() == "arm64":
+                machine = "arm64"
+
+                if LLMWareConfig().get_active_db() != "sqlite":
+                    logger.warning(f"Currently Windows Arm64 parser only supports SQLite.  Automatically "
+                                   f"changing active db setting to SQLite.")
+                    LLMWareConfig().set_active_db("sqlite")
+
+            else:
+                machine = "x86_64"
         else:
             system = platform.system().lower()
             machine = os.uname().machine.lower()
@@ -188,27 +151,25 @@ class Utilities:
         if system == 'linux' and machine not in ['aarch64', 'x86_64']:
             machine = 'x86_64'
 
-        # deprecation warning for aarch64 linux
         if system == 'linux' and machine == 'aarch64':
-            logger.warning("Deprecation warning: as of llmware 0.2.7, we are deprecating support for aarch64 "
-                           "linux - we build, support and test on the following strategic platforms - Linux x86_64, "
-                           "Linux x86_64 with CUDA, Windows x86_64, Windows x86_64 with CUDA, and Mac Metal.  "
-                           "We will revisit from time-to-time, due "
-                           "to availability and interest.  If you have an important need for "
-                           "support for aarch 64 linux, please raise an issue at github/llmware-ai/llmware.git")
+
+            """ 0.4.4 - aarch64 linux in process of being supported 
+                -- re-integrating parsers on aarch64 linux 
+                -- removing deprecation warnings """
+
+            pass
 
         #   deprecation warning for darwin x86_64
         if system == "darwin" and machine == "x86_64":
-            logger.warning("Deprecation warning: as of llmware 0.2.11, we are deprecating support for Mac x86_64 - "
-                           "we build, support, and test on Linux x86_64, Linux x86_64 with CUDA, Windows "
-                           "x86_64, Windows x86_64 with CUDA, and Mac Metal (M1-M2-M3).  We will revisit "
-                           "platform support from time-to-time, due to availability and interest.  "
-                           "If you have an important need to support this older version of Mac, please raise an "
-                           "issue at github/llmware-ai/llmware.git")
 
-        # Construct the path to a specific lib folder.  Eg. .../llmware/lib/darwin/x86_64
+            error_msg = ("Mac x86 detected as OS - this is not a supported platform.  Support "
+                         "was deprecated in llmware version 0.2.6 and removed in llmware version 0.3.9. "
+                         "Options - move to Mac Metal (M1+), back-level llmware to supported version, or "
+                         "if urgent requirement for Mac x86, please raise ticket on github.")
+
+            raise LLMWareException(message=error_msg)
+
         machine_dependent_lib_path = os.path.join(LLMWareConfig.get_config("shared_lib_path"), system, machine)
-
         _path_office = os.path.join(machine_dependent_lib_path, "llmware", "liboffice_llmware" + file_ext)
 
         _mod = None
@@ -216,12 +177,9 @@ class Utilities:
         try:
             # attempt to load the shared library with ctypes
             _mod = cdll.LoadLibrary(_path_office)
-
         except:
-
             # catch the error, if possible
-            logger.warning(f"warning: Module 'Office Parser' could not be loaded from path - "
-                           f"\n {_path_office}.\n")
+            logger.warning(f"Module 'Office Parser' could not be loaded from path - \n {_path_office}.\n")
 
         # if no module loaded, then raise exception
         if not _mod:
@@ -300,10 +258,10 @@ class Utilities:
                         # unusual, but if unable to write a particular element, then will catch error and skip
                         c.writerow(cfile[z])
                     except:
-                        logger.warning(f"warning: could not write item in row {z} - skipping")
+                        logger.warning(f"File save - could not write item in row {z} - skipping")
                         pass
                 else:
-                    logger.error(f"error:  CSV ERROR:   Row exceeds MAX SIZE: {sys.getsizeof(cfile[z])} - "
+                    logger.error(f"CSV ERROR:   Row exceeds MAX SIZE: {sys.getsizeof(cfile[z])} - "
                                  f"{cfile[z]}")
 
         csvfile.close()
@@ -474,6 +432,36 @@ class Utilities:
             logger.error(f"Error encoding string - {string}")
             return ""
 
+    def prune_stop_words(self, text,front=100,back=100):
+
+        """ Utility function that strips stop words from context text, with
+        the goal of reducing context size, while keeping semantic meaning in
+        place - intended for use in large contexts run in smaller memory space. """
+
+        stripped_text = ""
+        stop_words = Utilities().get_stop_words_master_list()
+        tokens = text.split(" ")
+        front_reserve = front
+        back_reserve = len(tokens) - back
+        word_reduction = 0
+
+        for i, tok in enumerate(tokens):
+
+            if front_reserve < i < back_reserve:
+                if tok.lower() in stop_words:
+                    word_reduction += 1
+                    pass
+                else:
+                    stripped_text += tok + " "
+            else:
+                stripped_text += tok + " "
+
+        logger.info(f"Utilities - prune_stop_words - {stripped_text}")
+        logger.info(f"Utilities - prune_stop_words - "
+                    f"word reduction - {word_reduction}")
+
+        return stripped_text
+
     @staticmethod
     def get_stop_words_master_list():
 
@@ -490,7 +478,7 @@ class Utilities:
                       "begins" ,"behind" ,"being" ,"believe" ,"below" ,"beside" ,"besides" ,"between" ,"beyond", "biol"
                       ,"both", "brief" ,"briefly" ,"but" ,"by" ,"c" ,"ca" ,"came" ,"can" ,"cannot" ,"can't" ,"cant" ,"cause"
                       ,"causes", "certain" ,"certainly" ,"co" ,"com" ,"come" ,"comes" ,"contain" ,"containing" ,"contains",
-                      "could","couldnt", "d" ,"date" ,"did" ,"didnt" ,"didn't", "different" ,"do" ,"does" ,"doesn't",
+                      "could","couldnt", "d","did" ,"didnt" ,"didn't", "different" ,"do" ,"does" ,"doesn't",
                       "doesnt" ,"doing","done","don't" ,"dont" ,"down" ,"downwards" ,"due" ,"during" ,"e" ,"each" ,
                       "ed","edu","effect","eg","e.g." ,"eight", "eighty" ,"either" ,"else" ,"elsewhere" ,"end" ,
                       "ending" ,"enough" ,"especially" ,"et" ,"etal" ,"etc" ,"even","ever" ,"every" ,"everybody",
@@ -508,7 +496,7 @@ class Utilities:
                       "l","largely","last","lately", "later","latter","latterly","least","less","lest","let","lets",
                       "let's" ,"like" ,"liked","likely", "line" ,"little" ,"'ll" ,"look" ,"looking" ,"looks",
                       "ltd" ,"m" ,"made" ,"mainly" ,"make" ,"makes","many", "may" ,"maybe" ,"me" ,"mean" ,"means" ,
-                      "meantime" ,"meanwhile" ,"merely" ,"mg" ,"might" ,"million","miss", "ml" ,"more" ,"moreover",
+                      "meantime" ,"meanwhile" ,"merely" ,"mg" ,"might","miss", "ml" ,"more" ,"moreover",
                       "most" ,"mostly" ,"mr" ,"mr." ,"mrs" ,"mrs." ,"ms", "ms." ,"much" ,"mug","must" ,"my" ,"myself",
                       "n" ,"na" ,"name" ,"namely" ,"nay" ,"nd" ,"near" ,"nearly" ,"necessarily" ,"necessary" ,"need"
                       ,"needs", "neither" ,"never""nevertheless" ,"new" ,"next" ,"nine" ,"ninety" ,"no" ,"nobody",
@@ -522,12 +510,12 @@ class Utilities:
                       "promptly" ,"proud" ,"provide", "provides" ,"put" ,"q" ,"que" ,"quickly" ,"quite" ,"qv" ,
                       "r" ,"ran" ,"rather" ,"rd" ,"re" ,"readily","really","recent" ,"recently" ,"ref" ,"refs",
                       "regarding" ,"regardless" ,"regards" ,"regard" ,"related","relative", "relatively" ,
-                      "research","respectively" ,"resulted" ,"resulting" ,"results" ,"right" ,"run" ,"s","said",
+                      "research","respectively" ,"resulted" ,"resulting", "right" ,"run" ,"s","said",
                       "same" ,"saw" ,"say" ,"saying" ,"says" ,"see" ,"seeing" ,"seem" ,"seemed","seeming","seems",
                       "seen" ,"self","selves" ,"sent" ,"seven" ,"several" ,"shall" ,"she" ,"shed" ,"she'll" ,"shes",
                       "she's" ,"should","shouldn't", "shouldnt" ,"show" ,"showed" ,"shown" ,"showns" ,"shows" ,
                       "significant" ,"significantly" ,"similar", "similarly" ,"since" ,"six" ,"slightly" ,"so" ,
-                      "some" ,"somebody" ,"somehow" ,"someone" ,"somethan","something" ,"sometime" ,"sometimes" ,
+                      "some" ,"somebody" ,"somehow" ,"someone","something" ,"sometime" ,"sometimes" ,
                       "somewhat" ,"somewhere" ,"soon" ,"sorry" ,"specifically","specified", "specify" ,
                       "specifying" ,"still" ,"stop" ,"strongly" ,"sub" ,"substantially" ,"successfully" ,"such",
                       "sufficiently" ,"suggest" ,"sup" ,"sure" ,"t" ,"take" ,"taken" ,"taking" ,"talk" ,
@@ -550,7 +538,7 @@ class Utilities:
                       "words" ,"world" ,"would" ,"wouldnt","www" ,"x" ,"xx" ,"xxx", "y" ,"yes" ,"yet" ,
                       "you" ,"youd" ,"you'll" ,"your" ,"youre" ,"yours" ,"yourself","yourselves" ,"you've" ,"z",
                       "zero" ,"xoxo", "ii", "iii", "iv" ,"ix" ,"vi" ,"vii" ,"viii" ,"<th>",
-                      "<tr>" ,"three" ,"ten" ,"view" ,"met" ,"follow" ,"consist" ,"lack" ,"lacks" ,"base" ,"based" ,"ago",
+                      "<tr>" ,"three" ,"ten" ,"view" ,"met" ,"follow" ,"consist" ,"lack" ,"lacks","based" ,"ago",
                       "addition" ,"additional" ,"depend" ,"depends" ,"include" ,"includes" ,"including" ,"continue"
                       ,"bring", "brings" ,"ahead" ,"add" ,"adds" ,"attribute" ,"attributes" ,"associated" ,"associate", "follow",
                       "happen" ,"happened" ,"happening" ,"single" ,"consider" ,"considered" ,"looked" ,"involve"
@@ -591,7 +579,7 @@ class Utilities:
 
         """ Used by CorpTokenizer to provide a clean list stripping punctuation. """
 
-        punctuation = ("-" ,"," ,"'", "/" ,"(')", "'('" ,":" ,".", "?" ,"%", "[", "]" ,"(')'" ,"('('" ,"'–'")
+        punctuation = ("-" ,"," ,"'", "/" ,"(')", "'('" ,":" ,".", "?" ,"%", "[", "]" ,"(')'" ,"('('" ,"'–'", ";")
         clean_out = []
         for z in range(0 ,len(token_list)):
             t = token_list[z]
@@ -649,6 +637,140 @@ class Utilities:
                 label_id.append(x)
 
         return label_id
+
+    def exact_search_dicts(self, query, output_dicts, text_key="text",remove_stop_words=True,
+                           mode="or"):
+
+        """ Executes a fast 'lightweight' in-memory token search across a list of dictionaries
+
+        -- query: filtering query - looking for an exact phrase
+        -- output_dicts: can be any list of dicts provided that the text_key is found in the dict
+        -- text_key: by default, this is "text", but can be configured to any field in the dict
+        -- remove_stop_words: set to True by default
+
+        Returns a subset of the list of the dicts with only those entries that match the query
+        """
+
+        matched_dicts = []
+
+        # handle edge case - if empty search result, then return all dicts with updated keys
+        if not query:
+            for i, entries in enumerate(output_dicts):
+                if "page_num" not in entries:
+                    if "master_index" in entries:
+                        page_num = entries["master_index"]
+                    else:
+                        page_num = 0
+                    entries.update({"page_num": page_num})
+                if "query" not in entries:
+                    entries.update({"query": ""})
+                matched_dicts.append(entries)
+            return matched_dicts
+
+        for i, entries in enumerate(output_dicts):
+
+            if query.lower() in entries[text_key].lower():
+
+                if "page_num" not in entries:
+                    if "master_index" in entries:
+                        page_num = entries["master_index"]
+                    else:
+                        page_num = 0
+
+                    entries.update({"page_num": page_num})
+
+                if "query" not in entries:
+                    entries.update({"query": query})
+
+                matched_dicts.append(entries)
+
+        return matched_dicts
+
+    def token_search_dicts(self, query, output_dicts, text_key="text",remove_stop_words=True,
+                           mode="or"):
+
+        """ Executes a fast 'lightweight' in-memory token search across a list of dictionaries
+
+        -- query: filtering query - tokenized
+        -- output_dicts: can be any list of dicts provided that the text_key is found in the dict
+        -- text_key: by default, this is "text", but can be configured to any field in the dict
+        -- remove_stop_words: set to True by default
+        -- mode: set to either logical 'or' or 'and'
+            -- if 'or', then will return any entry with one of the matching tokens in the query.
+            -- if 'and', then will return entry only if it contains all tokens in the query.
+
+        Returns a subset of the list of the dicts with only those entries that match the query
+        """
+
+        matched_dicts = []
+
+        c = CorpTokenizer(remove_stop_words=remove_stop_words, remove_numbers=False, one_letter_removal=True,
+                          remove_punctuation=True)
+
+        key_terms = c.tokenize(query)
+
+        # handle edge case - if empty search result, then return all dicts with updated keys
+        if len(key_terms) == 0:
+            for i, entries in enumerate(output_dicts):
+                if "page_num" not in entries:
+                    if "master_index" in entries:
+                        page_num = entries["master_index"]
+                    else:
+                        page_num = 0
+                    entries.update({"page_num": page_num})
+                if "query" not in entries:
+                    entries.update({"query": ""})
+                matched_dicts.append(entries)
+            return matched_dicts
+
+        # len of key_terms >= 1 -> initiate key term match search
+        for i, entries in enumerate(output_dicts):
+            text_tokens = c.tokenize(entries[text_key])
+            match = 0
+            keep = False
+
+            for j, tok in enumerate(key_terms):
+
+                # match of token with text
+                if tok in text_tokens:
+                    match += 1
+                    if mode == "or":
+                        keep = True
+                        break
+
+                # strip trailing 's' and look for match
+                elif tok.endswith("s"):
+                    if tok[:-1] in text_tokens:
+                        match += 1
+                        if mode == "or":
+                            keep = True
+                            break
+
+                # append trailing 's' and look for match
+                elif (tok+"s") in text_tokens:
+                    match += 1
+                    if mode == "or":
+                        keep = True
+                        break
+
+            if mode == "and" and match == len(key_terms):
+                keep = True
+
+            if keep:
+                if "page_num" not in entries:
+                    if "master_index" in entries:
+                        page_num = entries["master_index"]
+                    else:
+                        page_num = 0
+
+                    entries.update({"page_num": page_num})
+
+                if "query" not in entries:
+                    entries.update({"query": query})
+
+                matched_dicts.append(entries)
+
+        return matched_dicts
 
     def fast_search_dicts(self, query,output_dicts, text_key="text", remove_stop_words=True):
 
@@ -748,48 +870,42 @@ class Utilities:
 
         return matches_found
 
-    def locate_query_match(self,query, core_text):
+    def locate_query_match(self, query, core_text):
 
-        """ Utility function to locate the character-level match of a query inside a core_text. """
+        """ Utility function to locate character-level match of a query inside a core_text. """
 
+        import re
         matches_found = []
-
-        # edge case - but return empty match if query is null
         if not query:
             return matches_found
 
-        b = CorpTokenizer(one_letter_removal=False, remove_stop_words=False, remove_punctuation=False,
+        # tokenize the query
+
+        b = CorpTokenizer(one_letter_removal=True, remove_stop_words=True, remove_punctuation=True,
                           remove_numbers=False)
 
         query_tokens = b.tokenize(query)
 
-        for x in range(0, len(core_text)):
-            match = 0
-            for key_term in query_tokens:
-                if len(key_term) == 0:
-                    continue
+        # use simple whitespace tokenizing for core_text
+        text_tokens = core_text.split(" ")
 
-                if key_term.startswith('"'):
-                    key_term = key_term[1:-1]
+        char_count = 0
 
-                if core_text[x].lower() == key_term[0].lower():
-                    match += 1
-                    if (x + len(key_term)) <= len(core_text):
-                        for y in range(1, len(key_term)):
-                            if key_term[y].lower() == core_text[x + y].lower():
-                                match += 1
-                            else:
-                                match = -1
-                                break
+        for i, tok in enumerate(text_tokens):
 
-                        if match == len(key_term):
-                            new_entry = [x, key_term]
-                            matches_found.append(new_entry)
+            tok_clean = re.sub(r"[,.;:()?'-]", "", tok)
+
+            for qt in query_tokens:
+                if qt == tok_clean.lower():
+                    matches_found.append([char_count, tok])
+                    break
+
+            char_count += len(tok) + 1
 
         return matches_found
 
     def highlighter(self,matches, core_string, highlight_start_token="<b>",
-                    highlight_end_token="</b>"):
+                    highlight_end_token="</b>", exclude_stop_words=True):
 
         """ Utility function to 'highlight' a selected token, based on matches, typically found
         in locate_query_match function - useful for visual display of a matching keyword. """
@@ -802,21 +918,32 @@ class Utilities:
 
         updated_string = ""
         cursor_position = 0
+        stop_word_list = []
+
+        if exclude_stop_words:
+            stop_word_list = self.get_stop_words_master_list()
 
         for mat in matches:
             starter = mat[0]
             keyword = mat[1]
 
-            updated_string += core_string[cursor_position:starter]
-            updated_string += highlight_start_token
+            go_ahead = True
+            if exclude_stop_words:
+                if keyword in stop_word_list:
+                    go_ahead = False
 
-            # updated_string += keyword
-            # og_keyword preserves capitalization of original string
-            og_keyword = core_string[starter:(starter+len(keyword))]
-            updated_string += og_keyword
-            updated_string += highlight_end_token
+            if go_ahead:
 
-            cursor_position = starter + len(keyword)
+                updated_string += core_string[cursor_position:starter]
+                updated_string += highlight_start_token
+
+                # updated_string += keyword
+                # og_keyword preserves capitalization of original string
+                og_keyword = core_string[starter:(starter+len(keyword))]
+                updated_string += og_keyword
+                updated_string += highlight_end_token
+
+                cursor_position = starter + len(keyword)
 
         if cursor_position < len(core_string):
             updated_string += core_string[cursor_position:]
@@ -1277,10 +1404,9 @@ class CorpTokenizer:
 
         # strip the whitespace from the beginning and end of the text so we can tokenize the data
         text = text.strip()
-        # start with basic whitespace tokenizing, 
-        #is there a reason the text is being split on one space only?   
-        #text2 = text.split(" ")
-        # this line will split on whitespace regardless of tab or multispaces between words
+
+        # start with basic whitespace tokenizing,
+        # this line will split on whitespace regardless of tab or multi-spaces between words
         text2 = text.split()
 
         if self.remove_punctuation:
@@ -1456,10 +1582,14 @@ class AgentWriter:
         -- 'off'        - turns off (no action taken)
         """
 
-    def __init__(self):
+    def __init__(self, mode=None):
 
         # options configured through global LLMWareConfigs
-        self.mode = LLMWareConfig().get_agent_writer_mode()
+        if mode:
+            self.mode = mode
+        else:
+            self.mode = LLMWareConfig().get_agent_writer_mode()
+
         self.fp_base = LLMWareConfig().get_llmware_path()
         self.fn = LLMWareConfig().get_agent_log_file()
 
@@ -1574,7 +1704,26 @@ class LocalTokenizer:
                                            "pad_id": [1], "pad_token": "<pad>"},
 
             #   gpt2 tokenizer
-            "tokenizer_gpt2.json": {"bos_id": [50256], "bos_token": "", "eos_id": [50256], "eos_token": ""}
+            "tokenizer_gpt2.json": {"bos_id": [50256], "bos_token": "", "eos_id": [50256], "eos_token": ""},
+
+            #   granite tokenizer
+            "tokenizer_granite.json": {"bos_id": 100257, "bos_token": "<|end_of_text|>",
+                                       "eos_id": [100257], "eos_token": "<|end_of_text|>"},
+
+            "tokenizer_phi4.json": {"bos_id": 100257, "bos_token": "<|endoftext|>",
+                                    "eos_id": [100257, 100265], "eos_token": "<|endoftext|>"},
+
+            "tokenizer_phi4_mini.json": {"bos_id": 199999, "bos_token": "<|endoftext|>",
+                                         "eos_id": [199999, 200020], "eos_token": "<|endoftext|>"},
+
+            "tokenizer_stablelm_1_6.json": {"bos_id": 100257, "bos_token": "<|endoftext|>",
+                                            "eos_id": [100257], "eos_token": "<|endoftext|>"},
+
+            "tokenizer_gemma.json": {"bos_id": 2, "bos_token": "<bos>",
+                                     "eos_id": [1], "eos_token": "<eos>"},
+
+            "tokenizer_mistral_chat.json": {"bos_id": 1, "bos_token": "<s>",
+                                            "eos_id": [2, 32000, 32768], "eos_token": ["</s>", "<|im_end|>"]},
 
         }
 
@@ -1618,7 +1767,8 @@ class LocalTokenizer:
             #   only the tokenizer is needed
             from tokenizers import Tokenizer
         except:
-            raise LLMWareException(message="Exception: requires tokenizers to be installed.")
+            raise LLMWareException(message="LocalTokenizer class requires tokenizers to be installed, e.g., "
+                                           "`pip3 install tokenizers`.")
 
         model_repo_path = LLMWareConfig().get_model_repo_path()
 
@@ -1632,10 +1782,10 @@ class LocalTokenizer:
 
         tokenizers_in_cache = os.listdir(tokenizers_cache)
 
-        logger.debug(f"update: LocalTokenizer - tokenizers found in cache: {tokenizers_in_cache}")
+        logger.debug(f"LocalTokenizer - tokenizers found in cache: {tokenizers_in_cache}")
 
         if tokenizer_fn not in tokenizers_in_cache:
-            logger.info(f"update: LocalTokenizer - need to fetch tokenizer - {tokenizer_fn}")
+            logger.info(f"LocalTokenizer - need to fetch tokenizer - {tokenizer_fn}")
             self.fetch_tokenizer_from_hb(self.hf_repo_tokenizers, tokenizer_fn, tokenizers_cache)
 
         self.tokenizer = Tokenizer.from_file(os.path.join(tokenizers_cache, tokenizer_fn))
@@ -1800,7 +1950,11 @@ class Sources:
             #   relative to the context window, but there should be any other detrimental impacts
 
             default_tokenizer = "tokenizer_ll2.json"
-            self.tokenizer = LocalTokenizer(tokenizer_fn=default_tokenizer)
+            try:
+                self.tokenizer = LocalTokenizer(tokenizer_fn=default_tokenizer)
+            except:
+                logger.warning("Could not resolve tokenizer - some functionality may not work correctly."
+                               "\nHave you installed tokenizers, e.g., `pip3 install tokenizers`")
             return True
 
         return False
@@ -2089,3 +2243,4 @@ class Sources:
             chunks.append(new_dict)
 
         return chunks
+

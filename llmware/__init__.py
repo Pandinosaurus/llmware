@@ -1,4 +1,4 @@
-# Copyright 2023 and 2024 llmware
+# Copyright 2023-2026 llmware
 
 # Licensed under the Apache License, Version 2.0 (the "License"); you
 # may not use this file except in compliance with the License.  You
@@ -21,6 +21,6 @@ the vector databases.
 """
 
 
-__version__ = '0.3.8'
+__version__ = '0.4.6'
 __author__ = 'llmware'
 __license__ = 'Apache 2.0 License'
